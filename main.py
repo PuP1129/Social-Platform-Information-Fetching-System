@@ -4,7 +4,10 @@ import argparse
 import json
 from pathlib import Path
 
-OUTPUT_PATH = Path("output") / "search_results.json"
+from src.filters.post_url import filter_post_results
+
+RAW_OUTPUT_PATH = Path("output") / "search_results.json"
+POST_OUTPUT_PATH = Path("output") / "post_urls.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,7 +37,16 @@ def build_output(keyword: str, results: list[dict[str, str | None]]) -> dict[str
     }
 
 
-def write_output(payload: dict[str, object], output_path: Path = OUTPUT_PATH) -> None:
+def build_post_output(keyword: str, raw_result_count: int, posts: list[dict]) -> dict[str, object]:
+    return {
+        "keyword": keyword.strip(),
+        "raw_result_count": raw_result_count,
+        "post_count": len(posts),
+        "posts": posts,
+    }
+
+
+def write_output(payload: dict[str, object], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -62,11 +74,17 @@ def main() -> None:
         headless=args.headless,
         max_results=args.max_results,
     )
-    payload = build_output(keyword, results)
-    write_output(payload)
+    raw_payload = build_output(keyword, results)
+    write_output(raw_payload, RAW_OUTPUT_PATH)
 
-    print(f"Found {payload['result_count']} result(s).")
-    print(f"JSON written to {OUTPUT_PATH}")
+    posts = filter_post_results(raw_payload["results"])
+    post_payload = build_post_output(keyword, raw_payload["result_count"], posts)
+    write_output(post_payload, POST_OUTPUT_PATH)
+
+    print(f"Found {raw_payload['result_count']} raw result(s).")
+    print(f"Identified {post_payload['post_count']} post URL(s).")
+    print(f"Raw JSON written to {RAW_OUTPUT_PATH}")
+    print(f"Post URL JSON written to {POST_OUTPUT_PATH}")
 
 
 if __name__ == "__main__":

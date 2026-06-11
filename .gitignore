@@ -26,6 +26,24 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Playwright temporary files
+trace.zip
+playwright-report/
+test-results/
+
+# Browser authentication and cookies
+playwright/.auth/
+storage_state.json
+cookies.json
+
+# Runtime output
+output/*.json
+logs/*.log
+
+# Keep empty directories
+!output/.gitkeep
+!logs/.gitkeep
+
 # PyInstaller
 #   Usually these files are written by a python script from a template
 #   before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -216,17 +234,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-
-# Project runtime artifacts
-*.py[cod]
-.venv/
-venv/
-.env
-*.env
-trace.zip
-playwright-report/
-test-results/
-storage_state.json
-cookies.json
-output/*.json
-!output/.gitkeep
