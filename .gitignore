@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project runtime artifacts
+*.py[cod]
+.venv/
+venv/
+.env
+*.env
+trace.zip
+playwright-report/
+test-results/
+storage_state.json
+cookies.json
+output/*.json
+!output/.gitkeep
