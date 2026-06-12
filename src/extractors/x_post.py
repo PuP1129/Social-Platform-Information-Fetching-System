@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +10,7 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 from src.filters.post_url import classify_post_url
+from src.utils.metrics import parse_metric_count
 
 TWEET_ARTICLE_SELECTOR = 'article[data-testid="tweet"]'
 DEBUG_OUTPUT_DIR = Path("output") / "debug"
@@ -109,45 +109,6 @@ def _validate_storage_state_path(storage_state_path: str | Path | None) -> Path 
     if not path.is_file():
         raise ValueError(f"X storage state path is not a file: {path}")
     return path
-
-
-def parse_metric_count(value: str | None) -> int | None:
-    """Parse X-style metric counts such as 1.2K, 3.5M, or 12 replies."""
-    if value is None:
-        return None
-
-    text = value.strip()
-    if not text:
-        return None
-
-    match = re.search(
-        r"(\d+(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)(\s*[KkMmBb\u4e07\u4ebf\u5104])?",
-        text,
-    )
-    if match is None:
-        return None
-
-    number_text = match.group(1).replace(",", "")
-    suffix = (match.group(2) or "").strip().lower()
-
-    try:
-        number = float(number_text)
-    except ValueError:
-        return None
-
-    multiplier = {
-        "": 1,
-        "k": 1_000,
-        "m": 1_000_000,
-        "b": 1_000_000_000,
-        "\u4e07": 10_000,
-        "\u4ebf": 100_000_000,
-        "\u5104": 100_000_000,
-    }.get(suffix)
-    if multiplier is None:
-        return None
-
-    return int(number * multiplier)
 
 
 def _open_post_page(page: Page, canonical_url: str, timeout_ms: int) -> None:
@@ -580,6 +541,8 @@ def _safe_inner_text(locator: Locator, preserve_lines: bool = False) -> str | No
 
 
 def _first_text_matching(locator: Locator, pattern: str) -> str | None:
+    import re
+
     compiled = re.compile(pattern)
     for index in range(locator.count()):
         text = _safe_inner_text(locator.nth(index))

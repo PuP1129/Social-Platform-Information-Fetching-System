@@ -2,13 +2,14 @@
 
 ## 当前支持
 
-当前项目支持三个最小能力：
+当前项目支持：
 
-- 使用 Google Programmable Search Engine 搜索单个关键词
-- 识别、标准化并过滤 Google 结果中的 X/Facebook 帖子 URL
-- 输入单个公开 X 帖子 URL，采集目标主帖的基础信息
+- Google Programmable Search Engine 单关键词搜索
+- X/Facebook 帖子 URL 识别、标准化和过滤
+- 单个 X 帖子采集的实验性实现与诊断
+- 单个 Facebook 公开帖子的基础采集
 
-X 单帖采集不会采集评论内容，不使用登录状态、Cookie、账号认证或 X API。若 X 页面要求登录、帖子被删除、账号被冻结、内容不可用，或当前网络环境限制访问，采集可能失败。
+X 采集实验目前因登录限制暂停。Facebook 采集只处理无需绕过访问控制即可查看的公开帖子，不使用账号、密码、Cookie 或 storage state。
 
 ## 运行环境
 
@@ -29,40 +30,49 @@ X 单帖采集不会采集评论内容，不使用登录状态、Cookie、账号
 
 ## Google PSE 搜索
 
-默认使用有界面的 Chromium：
-
-```powershell
-.\.venv\Scripts\python.exe main.py --keyword "OpenAI"
-```
-
-headless 模式：
-
 ```powershell
 .\.venv\Scripts\python.exe main.py --keyword "OpenAI" --headless --max-results 10
 ```
 
-输出文件：
+输出：
 
-- `output/search_results.json`：未经过帖子过滤的 Google 原始搜索结果
+- `output/search_results.json`：Google 原始搜索结果
 - `output/post_urls.json`：过滤后的 X/Facebook 帖子 URL
 
 ## X 单帖采集
-
-运行命令：
 
 ```powershell
 .\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890"
 ```
 
+如需使用本地 Playwright storage state：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/create_x_storage_state.py --output ".playwright/x_test_account.json"
+.\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890" --x-storage-state ".playwright/x_test_account.json"
+```
+
+输出：
+
+- `output/x_post.json`
+- 失败诊断：`output/debug/x_post_failure.png`、`output/debug/x_post_failure.html`、`output/debug/x_post_diagnostics.json`
+
+## Facebook 单帖采集
+
+```powershell
+.\.venv\Scripts\python.exe main.py --facebook-url "https://www.facebook.com/example/posts/123"
+```
+
 headless 模式：
 
 ```powershell
-.\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890" --headless
+.\.venv\Scripts\python.exe main.py --facebook-url "https://www.facebook.com/example/posts/123" --headless
 ```
 
-输出文件：
+输出：
 
-- `output/x_post.json`
+- `output/facebook_post.json`
+- 失败诊断：`output/debug/facebook_post_failure.png`、`output/debug/facebook_post_failure.html`、`output/debug/facebook_post_diagnostics.json`
 
 当前提取字段：
 
@@ -71,25 +81,29 @@ headless 模式：
 - `input_url`
 - `canonical_url`
 - `author.name`
-- `author.handle`
+- `author.profile_url`
 - `content`
 - `publish_time`
+- `publish_time_text`
 - `reply_count`
-- `comment_count`
-- `repost_count`
 - `like_count`
-- `view_count`
 - `share_count`
+- `comment_count`
 - `comments`
 - `collected_at`
 - `collection_status`
+- `extraction_source`
 - `error`
 
-其中 `share_count` 当前固定为 `null`，`comments` 当前固定为空数组。作者、正文、发布时间或互动数据无法从页面公开内容中稳定获取时，允许为 `null`；缺失互动数据不会被默认写成 `0`。
+当前不采集评论内容，`comments` 固定为空数组。Facebook 帖子中的 `reply_count` 通常属于评论内部，本阶段不展开评论，因此一般为 `null`。缺失的互动数量不会默认写成 `0`。
+
+如果目标帖子 DOM 不可用，但页面存在帖子特定的标准 metadata，采集器可以返回 `page_metadata` 来源的 partial 结果。metadata fallback 不会伪造发布时间、互动数量或评论。
+
+登录墙、删除内容、隐私设置、群组限制或网络环境都可能导致采集失败。项目不会绕过验证码、登录限制或平台访问控制。
 
 ## 支持的帖子 URL 识别
 
-X 支持：
+X：
 
 - `https://x.com/{handle}/status/{post_id}`
 - `https://twitter.com/{handle}/status/{post_id}`
@@ -98,7 +112,7 @@ X 支持：
 - `https://x.com/{handle}/status/{post_id}/video/1`
 - `https://x.com/i/web/status/{post_id}`
 
-Facebook 支持：
+Facebook：
 
 - `https://www.facebook.com/{account}/posts/{post_id}`
 - `https://facebook.com/{account}/posts/pfbid...`
@@ -116,14 +130,15 @@ Facebook 支持：
 
 ## 当前未实现
 
+- Facebook 评论详情采集
+- Facebook 批量帖子采集
+- Facebook 自动登录
+- 私密帖子、好友可见帖子、群组非公开帖子采集
+- Reel、视频页、照片页采集
 - X 评论采集
 - X 批量采集
-- Facebook 正文采集
 - Reddit
 - MySQL
 - Scheduler
-- Cookie、登录或账号认证
-- X API
-- Google API
-- 代理、验证码绕过或反爬绕过
-- 并发采集
+- 并发
+- 验证码绕过、代理池或反检测功能

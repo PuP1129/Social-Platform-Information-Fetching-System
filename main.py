@@ -9,6 +9,7 @@ from src.filters.post_url import filter_post_results
 RAW_OUTPUT_PATH = Path("output") / "search_results.json"
 POST_OUTPUT_PATH = Path("output") / "post_urls.json"
 X_POST_OUTPUT_PATH = Path("output") / "x_post.json"
+FACEBOOK_POST_OUTPUT_PATH = Path("output") / "facebook_post.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--keyword", help="Single keyword to search.")
     input_group.add_argument("--x-url", help="Single X post URL to extract.")
+    input_group.add_argument("--facebook-url", help="Single public Facebook post URL to extract.")
     parser.add_argument("--headless", action="store_true", help="Run Chromium in headless mode.")
     parser.add_argument("--max-results", type=int, default=10, help="Maximum number of first-page results to save.")
     parser.add_argument(
@@ -23,6 +25,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to a local Playwright storage-state JSON file for authenticated X access.",
+    )
+    parser.add_argument(
+        "--facebook-storage-state",
+        type=Path,
+        default=None,
+        help="Path to a local Playwright storage-state JSON file for authenticated Facebook access.",
     )
     return parser.parse_args()
 
@@ -67,8 +75,14 @@ def main() -> None:
     args = parse_args()
     if args.keyword:
         run_search(args.keyword.strip(), args.headless, args.max_results)
-    else:
+    elif args.x_url:
         run_x_post_extraction(args.x_url.strip(), args.headless, args.x_storage_state)
+    else:
+        run_facebook_post_extraction(
+            args.facebook_url.strip(),
+            args.headless,
+            args.facebook_storage_state,
+        )
 
 
 def run_search(keyword: str, headless: bool, max_results: int) -> None:
@@ -118,6 +132,34 @@ def run_x_post_extraction(url: str, headless: bool, storage_state_path: Path | N
     else:
         print("X post extracted with partial data.")
     print(f"JSON written to {X_POST_OUTPUT_PATH}")
+
+
+def run_facebook_post_extraction(
+    url: str,
+    headless: bool,
+    storage_state_path: Path | None = None,
+) -> None:
+    try:
+        from src.extractors.facebook_post import FacebookPostExtractionError, extract_facebook_post
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+
+    print(f"Extracting Facebook post: {url}")
+    try:
+        payload = extract_facebook_post(
+            url=url,
+            headless=headless,
+            storage_state_path=storage_state_path,
+        )
+    except (ValueError, FacebookPostExtractionError) as exc:
+        raise SystemExit(f"Facebook post extraction failed: {exc}") from exc
+
+    write_output(payload, FACEBOOK_POST_OUTPUT_PATH)
+    if payload["collection_status"] == "success":
+        print("Facebook post extracted successfully.")
+    else:
+        print("Facebook post extracted with partial data.")
+    print(f"JSON written to {FACEBOOK_POST_OUTPUT_PATH}")
 
 
 def _raise_playwright_install_error(exc: ModuleNotFoundError) -> None:
