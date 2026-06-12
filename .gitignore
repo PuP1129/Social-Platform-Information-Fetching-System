@@ -32,12 +32,15 @@ playwright-report/
 test-results/
 
 # Browser authentication and cookies
+.playwright/
 playwright/.auth/
+*_storage_state.json
 storage_state.json
 cookies.json
 
 # Runtime output
 output/*.json
+output/debug/
 logs/*.log
 
 # Keep empty directories

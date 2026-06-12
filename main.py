@@ -8,13 +8,22 @@ from src.filters.post_url import filter_post_results
 
 RAW_OUTPUT_PATH = Path("output") / "search_results.json"
 POST_OUTPUT_PATH = Path("output") / "post_urls.json"
+X_POST_OUTPUT_PATH = Path("output") / "x_post.json"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Search one keyword with Google Programmable Search Engine.")
-    parser.add_argument("--keyword", required=True, help="Single keyword to search.")
+    parser = argparse.ArgumentParser(description="Search Google PSE or extract one X post.")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--keyword", help="Single keyword to search.")
+    input_group.add_argument("--x-url", help="Single X post URL to extract.")
     parser.add_argument("--headless", action="store_true", help="Run Chromium in headless mode.")
     parser.add_argument("--max-results", type=int, default=10, help="Maximum number of first-page results to save.")
+    parser.add_argument(
+        "--x-storage-state",
+        type=Path,
+        default=None,
+        help="Path to a local Playwright storage-state JSON file for authenticated X access.",
+    )
     return parser.parse_args()
 
 
@@ -56,23 +65,23 @@ def write_output(payload: dict[str, object], output_path: Path) -> None:
 
 def main() -> None:
     args = parse_args()
-    keyword = args.keyword.strip()
+    if args.keyword:
+        run_search(args.keyword.strip(), args.headless, args.max_results)
+    else:
+        run_x_post_extraction(args.x_url.strip(), args.headless, args.x_storage_state)
 
+
+def run_search(keyword: str, headless: bool, max_results: int) -> None:
     try:
         from src.search.google_pse import search_google_pse
     except ModuleNotFoundError as exc:
-        if exc.name == "playwright":
-            raise SystemExit(
-                "Playwright is not installed. Run `pip install -r requirements.txt` "
-                "and then `playwright install chromium`."
-            ) from exc
-        raise
+        _raise_playwright_install_error(exc)
 
     print(f"Searching Google PSE for: {keyword}")
     results = search_google_pse(
         keyword=keyword,
-        headless=args.headless,
-        max_results=args.max_results,
+        headless=headless,
+        max_results=max_results,
     )
     raw_payload = build_output(keyword, results)
     write_output(raw_payload, RAW_OUTPUT_PATH)
@@ -85,6 +94,39 @@ def main() -> None:
     print(f"Identified {post_payload['post_count']} post URL(s).")
     print(f"Raw JSON written to {RAW_OUTPUT_PATH}")
     print(f"Post URL JSON written to {POST_OUTPUT_PATH}")
+
+
+def run_x_post_extraction(url: str, headless: bool, storage_state_path: Path | None = None) -> None:
+    try:
+        from src.extractors.x_post import XPostExtractionError, extract_x_post
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+
+    print(f"Extracting X post: {url}")
+    try:
+        payload = extract_x_post(
+            url=url,
+            headless=headless,
+            storage_state_path=storage_state_path,
+        )
+    except (ValueError, XPostExtractionError) as exc:
+        raise SystemExit(f"X post extraction failed: {exc}") from exc
+
+    write_output(payload, X_POST_OUTPUT_PATH)
+    if payload["collection_status"] == "success":
+        print("X post extracted successfully.")
+    else:
+        print("X post extracted with partial data.")
+    print(f"JSON written to {X_POST_OUTPUT_PATH}")
+
+
+def _raise_playwright_install_error(exc: ModuleNotFoundError) -> None:
+    if exc.name == "playwright":
+        raise SystemExit(
+            "Playwright is not installed. Run `pip install -r requirements.txt` "
+            "and then `playwright install chromium`."
+        ) from exc
+    raise exc
 
 
 if __name__ == "__main__":

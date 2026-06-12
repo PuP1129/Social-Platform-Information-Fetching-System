@@ -1,155 +1,129 @@
 # 社媒搜索内容采集系统
 
-## 当前阶段目标
+## 当前支持
 
-当前项目支持单关键词 Google Programmable Search Engine 搜索，并对第一页原始搜索结果中的 URL 做保守识别，只保留明确匹配的 X/Facebook 帖子 URL。
+当前项目支持三个最小能力：
 
-本阶段只识别和规范化帖子 URL，不打开 X 或 Facebook 页面，也不采集正文、作者、发布时间、互动数据或评论。
+- 使用 Google Programmable Search Engine 搜索单个关键词
+- 识别、标准化并过滤 Google 结果中的 X/Facebook 帖子 URL
+- 输入单个公开 X 帖子 URL，采集目标主帖的基础信息
 
-## 项目目录结构
+X 单帖采集不会采集评论内容，不使用登录状态、Cookie、账号认证或 X API。若 X 页面要求登录、帖子被删除、账号被冻结、内容不可用，或当前网络环境限制访问，采集可能失败。
 
-```text
-project/
-├── src/
-│   ├── filters/
-│   │   ├── __init__.py
-│   │   └── post_url.py
-│   ├── search/
-│   │   ├── __init__.py
-│   │   └── google_pse.py
-│   └── __init__.py
-├── tests/
-│   └── test_post_url.py
-├── legacy/
-├── docs/
-├── output/
-│   └── .gitkeep
-├── main.py
-├── requirements.txt
-├── README.md
-└── .gitignore
+## 运行环境
+
+本项目在 Windows 本地虚拟环境中运行。执行 Python 命令时请显式使用：
+
+```powershell
+.\.venv\Scripts\python.exe
 ```
+
+不要假设 shell 已经激活虚拟环境。
 
 ## 安装依赖
 
-```bash
-pip install -r requirements.txt
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-首次安装 Playwright 后，需要安装 Chromium：
-
-```bash
-playwright install chromium
-```
-
-## 运行方式
+## Google PSE 搜索
 
 默认使用有界面的 Chromium：
 
-```bash
-python main.py --keyword "OpenAI"
+```powershell
+.\.venv\Scripts\python.exe main.py --keyword "OpenAI"
 ```
 
-使用 headless 模式：
+headless 模式：
 
-```bash
-python main.py --keyword "OpenAI" --headless
+```powershell
+.\.venv\Scripts\python.exe main.py --keyword "OpenAI" --headless --max-results 10
 ```
 
-限制最多返回结果数量：
+输出文件：
 
-```bash
-python main.py --keyword "OpenAI" --max-results 5
+- `output/search_results.json`：未经过帖子过滤的 Google 原始搜索结果
+- `output/post_urls.json`：过滤后的 X/Facebook 帖子 URL
+
+## X 单帖采集
+
+运行命令：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890"
 ```
 
-## JSON 输出
+headless 模式：
 
-原始 Google PSE 搜索结果写入：
-
-```text
-output/search_results.json
+```powershell
+.\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890" --headless
 ```
 
-过滤后的帖子 URL 写入：
+输出文件：
 
-```text
-output/post_urls.json
-```
+- `output/x_post.json`
 
-如果没有识别到帖子 URL，`post_urls.json` 仍会生成合法 JSON，`post_count` 为 `0`，`posts` 为空数组。
+当前提取字段：
 
-## 支持的 X URL 格式
+- `platform`
+- `post_id`
+- `input_url`
+- `canonical_url`
+- `author.name`
+- `author.handle`
+- `content`
+- `publish_time`
+- `reply_count`
+- `comment_count`
+- `repost_count`
+- `like_count`
+- `view_count`
+- `share_count`
+- `comments`
+- `collected_at`
+- `collection_status`
+- `error`
 
-支持以下域名，并统一规范化为 `x.com`：
+其中 `share_count` 当前固定为 `null`，`comments` 当前固定为空数组。作者、正文、发布时间或互动数据无法从页面公开内容中稳定获取时，允许为 `null`；缺失互动数据不会被默认写成 `0`。
 
-- `x.com`
-- `www.x.com`
-- `twitter.com`
-- `www.twitter.com`
-- `mobile.twitter.com`
+## 支持的帖子 URL 识别
 
-当前支持的帖子格式：
+X 支持：
 
-- `https://x.com/openai/status/1234567890`
-- `https://twitter.com/OpenAI/status/1234567890`
-- `https://mobile.twitter.com/openai/status/1234567890`
-- `https://x.com/openai/status/1234567890/photo/1`
-- `https://x.com/openai/status/1234567890/video/1`
-- `https://x.com/i/web/status/1234567890`
+- `https://x.com/{handle}/status/{post_id}`
+- `https://twitter.com/{handle}/status/{post_id}`
+- `https://mobile.twitter.com/{handle}/status/{post_id}`
+- `https://x.com/{handle}/status/{post_id}/photo/1`
+- `https://x.com/{handle}/status/{post_id}/video/1`
+- `https://x.com/i/web/status/{post_id}`
 
-会删除 query、fragment、`/photo/1`、`/video/1` 以及 status ID 后面的展示后缀。去重优先使用 `(platform, post_id)`。
+Facebook 支持：
 
-## 支持的 Facebook URL 格式
+- `https://www.facebook.com/{account}/posts/{post_id}`
+- `https://facebook.com/{account}/posts/pfbid...`
+- `https://m.facebook.com/{account}/posts/{post_id}`
+- `https://www.facebook.com/permalink.php?story_fbid=...&id=...`
+- `https://m.facebook.com/story.php?story_fbid=...&id=...`
 
-支持以下域名，并统一规范化为 `www.facebook.com`：
+## 测试
 
-- `facebook.com`
-- `www.facebook.com`
-- `m.facebook.com`
-
-当前支持的帖子格式：
-
-- `https://www.facebook.com/openai/posts/1234567890`
-- `https://facebook.com/openai/posts/pfbidExample123`
-- `https://m.facebook.com/openai/posts/1234567890`
-- `https://www.facebook.com/permalink.php?story_fbid=1234567890&id=987654321`
-- `https://m.facebook.com/story.php?story_fbid=1234567890&id=987654321`
-
-`/posts/` 后的 ID 支持数字或以 `pfbid` 开头的字母数字标识。`permalink.php` 和 `story.php` 至少需要有效的 `story_fbid`。
-
-## 明确不支持的 URL
-
-当前不会把以下页面识别为帖子：
-
-- X 用户主页、搜索页、话题页、首页、intent 页面
-- Facebook 用户主页、搜索页、登录页、marketplace、groups、reel、watch、videos、photos、share 页面
-- Reddit 页面
-- 无法确定为帖子详情页的其他 URL
-
-## 运行测试
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-也可以执行基础检查：
-
-```bash
-python -m compileall src tests main.py
-python main.py --help
+```powershell
+.\.venv\Scripts\python.exe -m compileall src tests main.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe main.py --help
 ```
 
 ## 当前未实现
 
-当前阶段未实现以下内容：
-
-- 搜索结果分页
-- X/Facebook 正文采集
-- 评论采集
-- Cookie、登录或账号认证
+- X 评论采集
+- X 批量采集
+- Facebook 正文采集
 - Reddit
 - MySQL
-- 定时任务
-- Google Custom Search JSON API
-- API Key 相关代码
+- Scheduler
+- Cookie、登录或账号认证
+- X API
+- Google API
+- 代理、验证码绕过或反爬绕过
 - 并发采集
