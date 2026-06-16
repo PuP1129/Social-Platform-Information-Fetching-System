@@ -15,6 +15,7 @@ from src.extractors.facebook_post import (
     _collect_failure_diagnostics,
     _extract_action_count_details,
     _extract_article_data,
+    _extract_author,
     _extract_metrics,
     _find_target_article,
     _find_target_article_result,
@@ -28,6 +29,7 @@ from src.extractors.facebook_post import (
     _select_best_publish_time_candidate,
     _semantic_score,
     _target_post_link_selector,
+    _normalize_facebook_profile_url,
     _visible_publish_time_candidates,
     extract_facebook_post,
 )
@@ -121,6 +123,7 @@ class FacebookTargetSemanticsTests(unittest.TestCase):
         self.assertIn('story_fbid=1449348982581954', selector)
         self.assertIn('/posts/1449348982581954', selector)
         self.assertIn('permalink.php', selector)
+        self.assertIn('comment_id', selector)
 
     def test_container_scoring_prefers_content_and_time_over_weak_metrics(self) -> None:
         weak_presence = {
@@ -166,6 +169,69 @@ class FacebookTargetSemanticsTests(unittest.TestCase):
                 target = _find_target_article(page, "123")
                 self.assertIsNotNone(target)
                 self.assertEqual(target.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_comment_permalink_with_target_post_id_is_not_strong_identity(self) -> None:
+        html = """
+        <div role="dialog">
+          <div role="article" id="comment">
+            <a href="https://www.facebook.com/groups/book/posts/123?comment_id=999">1y</a>
+            <a href="https://www.facebook.com/groups/book/user/456">Commenter</a>
+            <div>Only a comment body with target post id in its permalink.</div>
+          </div>
+          <div id="target" role="dialog" aria-label="Author Name's Post">
+            <a href="https://www.facebook.com/groups/book/user/111">Author Name</a>
+            <a aria-label="May 30, 2023">May 30, 2023</a>
+            <div data-ad-preview="message">This is the actual main post body with enough text.</div>
+            <div role="button"><div data-ad-rendering-role="like_button"></div><span dir="auto">4</span></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div><span dir="auto">48</span></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "123")
+
+                self.assertIsNotNone(selection)
+                self.assertNotEqual(selection.locator.get_attribute("id"), "comment")
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_group_post_container_can_be_confirmed_without_comment_permalink_identity(self) -> None:
+        html = """
+        <html>
+          <head><title>(1) Book Lovers | What is your favorite book | Facebook</title></head>
+          <body>
+            <div role="dialog" id="target" aria-label="Joy Lahman's Post">
+              <h2>Joy Lahman's Post</h2>
+              <a href="/groups/128051067263878/user/111">Joy Lahman</a>
+              <a aria-label="December 12, 2024">December 12, 2024</a>
+              <div data-ad-preview="message">What is your favorite book? The one that you read over and over again.</div>
+              <button aria-label="Actions for this post by Joy Lahman">Actions</button>
+              <div role="button"><div data-ad-rendering-role="like_button"></div><span dir="auto">4</span></div>
+              <div role="button"><div data-ad-rendering-role="comment_button"></div><span dir="auto">48</span></div>
+            </div>
+            <div role="article" id="comment">
+              <a href="/groups/128051067263878/posts/8702397713162461?comment_id=1">1y</a>
+              <div>Born a crime</div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "8702397713162461")
+
+                self.assertIsNotNone(selection)
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
             finally:
                 browser.close()
 
@@ -428,6 +494,84 @@ class FacebookTargetSemanticsTests(unittest.TestCase):
                 self.assertEqual(result["comments"], [])
                 self.assertNotIn("reply_count", result)
                 self.assertEqual(result["collection_status"], "success")
+            finally:
+                browser.close()
+
+    def test_extract_author_accepts_group_user_link_and_normalizes_it(self) -> None:
+        html = """
+        <div id="target">
+          <a href="/groups/128051067263878/user/1241477756/?__cft__=secret&__tn__=x">Wendi Lynn</a>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                author = _extract_author(page.locator("#target"))
+
+                self.assertEqual(author["name"], "Wendi Lynn")
+                self.assertEqual(
+                    author["profile_url"],
+                    "https://www.facebook.com/groups/128051067263878/user/1241477756",
+                )
+                self.assertEqual(
+                    _normalize_facebook_profile_url(
+                        "https://www.facebook.com/groups/128051067263878/user/1241477756/?rdid=x#frag"
+                    ),
+                    "https://www.facebook.com/groups/128051067263878/user/1241477756",
+                )
+            finally:
+                browser.close()
+
+    def test_extract_author_falls_back_to_dialog_or_action_label(self) -> None:
+        html = """
+        <div role="dialog" id="dialog" aria-label="Mike Gentry's Post">
+          <button aria-label="Actions for this post by Mike Gentry">Actions</button>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                author = _extract_author(page.locator("#dialog"))
+
+                self.assertEqual(author["name"], "Mike Gentry")
+                self.assertIsNone(author["profile_url"])
+            finally:
+                browser.close()
+
+    def test_dialog_visible_content_prefers_main_text_before_comments(self) -> None:
+        html = """
+        <div role="dialog" id="dialog" aria-label="Joy Lahman's Post">
+          <h2>Joy Lahman's Post</h2>
+          <a href="/groups/128051067263878/user/100013658857173">Joy Lahman</a>
+          <span>D</span><span>e</span><span>c</span>
+          <div>What is your favorite book? The one that you read over and over again.</div>
+          <div>4</div>
+          <div>48</div>
+          <div>Newest</div>
+          <div role="article">Felecia Gaspard Hendricks NoraRoberts, midnight bayou. 1y Like Reply Share</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                result = _extract_article_data(
+                    page.locator("#dialog"),
+                    "https://www.facebook.com/groups/mybookloversclub/posts/8702397713162461",
+                    "https://www.facebook.com/groups/mybookloversclub/posts/8702397713162461",
+                    "8702397713162461",
+                    context_type="group",
+                )
+
+                self.assertEqual(
+                    result["content"],
+                    "What is your favorite book? The one that you read over and over again.",
+                )
             finally:
                 browser.close()
 

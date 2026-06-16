@@ -83,6 +83,23 @@ class FacebookDebugBundleTests(unittest.TestCase):
             self.assertNotIn("secret-password", combined_text)
             self.assertIn("[REDACTED]", combined_text)
 
+    def test_bundle_diagnostics_preserve_full_payload(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle_dir = Path(temp_dir) / "0001_123"
+            rich_diagnostics = {
+                "input_url": "https://www.facebook.com/example/posts/123",
+                "target_post_id": "123",
+                "container_match_strategy": "message_ancestor_title_match",
+                "field_locator_presence": {"author": True, "content": True},
+            }
+
+            save_facebook_debug_bundle(FakePage(), bundle_dir, diagnostics=rich_diagnostics)
+            diagnostics = json.loads((bundle_dir / "diagnostics.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(diagnostics["target_post_id"], "123")
+            self.assertEqual(diagnostics["container_match_strategy"], "message_ancestor_title_match")
+            self.assertEqual(diagnostics["field_locator_presence"]["author"], True)
+
     def test_multiple_batch_directories_do_not_conflict(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -81,11 +81,13 @@ def run_facebook_batch(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
+    active_output_path = output_path
     if resume:
         processed_urls = _read_processed_urls(output_path)
     else:
         processed_urls = set()
-        output_path.write_text("", encoding="utf-8")
+        active_output_path = _temporary_batch_output_path(output_path)
+        active_output_path.write_text("", encoding="utf-8")
 
     started_at = _utc_now()
     current_records: list[dict[str, Any]] = []
@@ -106,7 +108,7 @@ def run_facebook_batch(
         for index, item in enumerate(items, start=1):
             if item.skip_reason is not None:
                 record = _skipped_record(item, item.skip_reason)
-                _append_jsonl_record(output_path, record)
+                _append_jsonl_record(active_output_path, record)
                 current_records.append(record)
                 skipped_this_run += 1
                 failure_types[item.skip_reason] += 1
@@ -120,7 +122,7 @@ def run_facebook_batch(
 
             if login_wall_streak >= LOGIN_WALL_STOP_THRESHOLD:
                 record = _skipped_record(item, "batch_stopped_due_to_login_wall")
-                _append_jsonl_record(output_path, record)
+                _append_jsonl_record(active_output_path, record)
                 current_records.append(record)
                 skipped_this_run += 1
                 failure_types["batch_stopped_due_to_login_wall"] += 1
@@ -135,7 +137,7 @@ def run_facebook_batch(
                 timeout_ms=timeout_ms,
                 save_debug_bundle=save_debug_bundle,
             )
-            _append_jsonl_record(output_path, record)
+            _append_jsonl_record(active_output_path, record)
             current_records.append(record)
             processed_this_run += 1
             processed_urls.add(resume_key)
@@ -156,6 +158,9 @@ def run_facebook_batch(
         _close_quietly(browser)
         if playwright is not None:
             playwright.stop()
+
+    if not resume:
+        active_output_path.replace(output_path)
 
     total_records = _read_jsonl_records(output_path)
     summary = _build_summary(
@@ -324,7 +329,14 @@ def _process_supported_item(
                 trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip" if should_save_bundle else None)
                 trace_started = False
             if should_save_bundle:
-                payload.update(save_facebook_debug_bundle(page, bundle_dir, trace_error=trace_error))
+                payload.update(
+                    save_facebook_debug_bundle(
+                        page,
+                        bundle_dir,
+                        diagnostics=_read_json_file(FAILURE_DIAGNOSTICS_PATH),
+                        trace_error=trace_error,
+                    )
+                )
             diagnostics_paths = copy_latest_facebook_diagnostics(index, payload.get("post_id") or item.post_id, diagnostics_dir)
             payload.update(diagnostics_paths)
             return payload, None
@@ -340,6 +352,8 @@ def _process_supported_item(
                     trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip")
                     trace_started = False
                 diagnostics = exc.diagnostics if isinstance(exc, FacebookPostExtractionError) else None
+                if diagnostics is None:
+                    diagnostics = _read_json_file(FAILURE_DIAGNOSTICS_PATH)
                 record.update(save_facebook_debug_bundle(page, bundle_dir, diagnostics=diagnostics, trace_error=trace_error))
             diagnostics_paths = copy_latest_facebook_diagnostics(index, item.post_id, diagnostics_dir)
             record.update(diagnostics_paths)
@@ -479,6 +493,18 @@ def _read_jsonl_records(output_path: Path) -> list[dict[str, Any]]:
 def _append_jsonl_record(output_path: Path, record: dict[str, Any]) -> None:
     with output_path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _temporary_batch_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f".{output_path.name}.tmp")
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _validate_storage_state_path(storage_state_path: str | Path | None) -> Path:

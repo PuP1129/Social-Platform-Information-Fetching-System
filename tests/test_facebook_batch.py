@@ -206,7 +206,7 @@ class FacebookBatchRunTests(unittest.TestCase):
         self.assertEqual(calls, 0)
         self.assertEqual(summary["current_run"]["skipped_count"], 1)
 
-    def test_non_resume_truncates_existing_output(self) -> None:
+    def test_non_resume_replaces_existing_output_after_success(self) -> None:
         with TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
             input_path = temp / "input.json"
@@ -228,6 +228,34 @@ class FacebookBatchRunTests(unittest.TestCase):
             )
 
             self.assertNotIn("old", output_path.read_text(encoding="utf-8"))
+
+    def test_non_resume_interruption_does_not_truncate_existing_output(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            input_path = temp / "input.json"
+            output_path = temp / "out.jsonl"
+            summary_path = temp / "summary.json"
+            storage = temp / "state.json"
+            _touch_storage_state(storage)
+            _write_json(input_path, ["https://www.facebook.com/example/posts/123"])
+            original = json.dumps({"input_url": "old", "collection_status": "success"}) + "\n"
+            output_path.write_text(original, encoding="utf-8")
+
+            def interrupted(_context: object, _url: str) -> dict[str, object]:
+                raise KeyboardInterrupt()
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_facebook_batch(
+                    input_path=input_path,
+                    storage_state_path=storage,
+                    output_path=output_path,
+                    summary_path=summary_path,
+                    diagnostics_dir=temp / "debug",
+                    extractor=interrupted,
+                    sleep_fn=lambda _seconds: None,
+                )
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), original)
 
     def test_login_wall_threshold_marks_remaining_items_skipped(self) -> None:
         with TemporaryDirectory() as temp_dir:

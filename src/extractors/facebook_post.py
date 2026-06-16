@@ -128,7 +128,14 @@ def extract_facebook_post(
             trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip" if should_save else None)
             trace_started = False
         if should_save:
-            payload.update(save_facebook_debug_bundle(page, bundle_dir, trace_error=trace_error))
+            payload.update(
+                save_facebook_debug_bundle(
+                    page,
+                    bundle_dir,
+                    diagnostics=_read_json_file(FAILURE_DIAGNOSTICS_PATH),
+                    trace_error=trace_error,
+                )
+            )
         return payload
     except Exception as exc:
         if page is not None and context is not None:
@@ -139,6 +146,8 @@ def extract_facebook_post(
             else:
                 trace_error = None
             diagnostics = exc.diagnostics if isinstance(exc, FacebookPostExtractionError) else None
+            if diagnostics is None:
+                diagnostics = _read_json_file(FAILURE_DIAGNOSTICS_PATH)
             save_facebook_debug_bundle(page, bundle_dir, diagnostics=diagnostics, trace_error=trace_error)
         raise
     finally:
@@ -264,6 +273,14 @@ def _validate_storage_state_path(storage_state_path: str | Path | None) -> Path 
     return path
 
 
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _open_post_page(page: Page, canonical_url: str, timeout_ms: int) -> None:
     try:
         page.goto(canonical_url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -327,6 +344,10 @@ def _find_target_article_result(page: Page, post_id: str) -> TargetContainerSele
     if best_selection is not None:
         return best_selection
 
+    dialog_selection = _find_dialog_by_author_action_context(page, post_id, title_context)
+    if dialog_selection is not None:
+        return dialog_selection
+
     if _is_single_post_permalink(page, post_id):
         fallback = _single_semantic_post_container(page)
         if fallback is not None:
@@ -353,11 +374,12 @@ def _target_post_link_locator(page: Page, post_id: str) -> Locator:
 
 
 def _target_post_link_selector(post_id: str) -> str:
+    not_comment = ':not([href*="comment_id="]):not([href*="comment_id%3D"]):not([href*="reply_comment_id="])'
     selectors = (
-        f'a[href*="story_fbid={post_id}"]',
-        f'a[href*="/posts/{post_id}"]',
-        f'a[href*="permalink.php"][href*="{post_id}"]',
-        f'a[href*="{post_id}"]',
+        f'a[href*="story_fbid={post_id}"]{not_comment}',
+        f'a[href*="/posts/{post_id}"]{not_comment}',
+        f'a[href*="permalink.php"][href*="{post_id}"]{not_comment}',
+        f'a[href*="{post_id}"]{not_comment}',
     )
     return ", ".join(selectors)
 
@@ -373,6 +395,156 @@ def _single_semantic_post_container(page: Page) -> Locator | None:
     if len(candidates) == 1:
         return candidates[0]
     return None
+
+
+def _find_dialog_by_author_action_context(
+    page: Page,
+    post_id: str,
+    title_context: dict[str, str | None],
+) -> TargetContainerSelection | None:
+    dialogs = page.locator('[role="dialog"]')
+    candidates: list[dict[str, Any]] = []
+    for index in range(_safe_count(dialogs)):
+        dialog = dialogs.nth(index)
+        summary = _dialog_author_action_summary(dialog, index, title_context)
+        if bool(summary["is_valid_candidate"]):
+            candidates.append(summary)
+
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda item: (
+            int(item["container_score"]),
+            float(item["title_overlap_score"]),
+            -int(item["descendant_count"]),
+        ),
+        reverse=True,
+    )
+    best = candidates[0]
+
+    selected_index = int(best["index"])
+    selected = dialogs.nth(selected_index)
+    return TargetContainerSelection(
+        locator=selected,
+        candidate_index=selected_index,
+        metrics=_container_metrics(selected, post_id),
+        strategy="dialog_author_action_context",
+        score=int(best["container_score"]),
+        score_reasons=tuple(str(reason) for reason in best.get("score_reasons", [])),
+    )
+
+
+def _dialog_author_action_summary(
+    dialog: Locator,
+    index: int,
+    title_context: dict[str, str | None],
+) -> dict[str, Any]:
+    script = r"""
+    (element) => {
+      const text = (element.innerText || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+      const actionLabels = Array.from(element.querySelectorAll('[aria-label]'))
+        .map((node) => node.getAttribute('aria-label') || '')
+        .filter((label) => label.toLowerCase().includes('actions for this post by'));
+      const headingTexts = Array.from(element.querySelectorAll('h1, h2, h3, [role="heading"]'))
+        .map((node) => (node.innerText || '').replace(/\\s+/g, ' ').trim())
+        .filter(Boolean);
+      const messageSelector = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
+      return {
+        aria_label: element.getAttribute('aria-label') || '',
+        text,
+        action_labels: actionLabels,
+        heading_texts: headingTexts,
+        descendant_count: element.querySelectorAll('*').length,
+        message_count: element.querySelectorAll(messageSelector).length,
+        timestamp_candidate_count: element.querySelectorAll('time, a[aria-label], [aria-labelledby], [title]').length,
+        reaction_marker_count: element.querySelectorAll('[data-ad-rendering-role="like_button"]').length,
+        comment_marker_count: element.querySelectorAll('[data-ad-rendering-role="comment_button"]').length,
+        share_marker_count: element.querySelectorAll('[data-ad-rendering-role="share_button"]').length,
+      };
+    }
+    """
+    defaults = {
+        "aria_label": "",
+        "text": "",
+        "action_labels": [],
+        "heading_texts": [],
+        "descendant_count": 1_000_000,
+        "message_count": 0,
+        "timestamp_candidate_count": 0,
+        "reaction_marker_count": 0,
+        "comment_marker_count": 0,
+        "share_marker_count": 0,
+    }
+    try:
+        raw = dialog.evaluate(script)
+    except PlaywrightError:
+        raw = defaults
+    if not isinstance(raw, dict):
+        raw = defaults
+
+    text = str(raw.get("text") or "")
+    action_labels = [str(label) for label in raw.get("action_labels") or []]
+    heading_texts = [str(label) for label in raw.get("heading_texts") or []]
+    author_names = [
+        name
+        for name in (
+            _author_name_from_post_label(str(raw.get("aria_label") or "")),
+            *(_author_name_from_post_label(text) for text in heading_texts),
+            *(_author_name_from_action_label(label) for label in action_labels),
+        )
+        if name
+    ]
+    title_overlap_score = _title_overlap_score(text, title_context.get("content_fragment"))
+    marker_count = int(raw.get("reaction_marker_count") or 0) + int(raw.get("comment_marker_count") or 0) + int(raw.get("share_marker_count") or 0)
+    timestamp_count = int(raw.get("timestamp_candidate_count") or 0)
+    message_count = int(raw.get("message_count") or 0)
+    descendant_count = int(raw.get("descendant_count") or 0)
+
+    score = 0
+    reasons: list[str] = []
+    if author_names:
+        score += 5
+        reasons.append("dialog_or_action_author")
+    if title_overlap_score >= 0.65:
+        score += 5
+        reasons.append("dialog_title_text_match")
+    if message_count >= 1:
+        score += 3
+        reasons.append("message_present")
+    if timestamp_count > 0:
+        score += 2
+        reasons.append("timestamp_present")
+    if marker_count > 0:
+        score += min(marker_count, 3)
+        reasons.append("interaction_markers_present")
+    if len(text) < 40:
+        score -= 4
+        reasons.append("too_short_for_main_post")
+    if descendant_count > 3_000 or len(text) > 8_000:
+        score -= 3
+        reasons.append("too_broad_for_single_post")
+
+    has_title_or_single_dialog_signal = title_overlap_score >= 0.65 or _safe_count(dialog.locator('[role="dialog"]')) <= 1
+    is_valid = (
+        bool(author_names)
+        and has_title_or_single_dialog_signal
+        and (message_count >= 1 or marker_count > 0)
+        and timestamp_count > 0
+        and score >= 9
+        and descendant_count <= 3_000
+    )
+    return {
+        "index": index,
+        "text_preview": text[:240],
+        "text_length": len(text),
+        "author_candidates": author_names[:3],
+        "title_overlap_score": title_overlap_score,
+        "descendant_count": descendant_count,
+        "container_score": score,
+        "score_reasons": reasons,
+        "is_valid_candidate": is_valid,
+    }
 
 
 def _container_score(field_presence: dict[str, bool]) -> int:
@@ -392,19 +564,27 @@ def _container_score(field_presence: dict[str, bool]) -> int:
 
 
 def _container_metrics(container: Locator, post_id: str) -> dict[str, int | bool]:
-    script = """
+    script = r"""
     (element, postId) => {
       const messageSelector = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
       const targetLinks = Array.from(element.querySelectorAll('a[href]')).filter((link) => {
         const href = link.getAttribute('href') || '';
-        return href.includes(postId) ||
+        const isCommentPermalink = href.includes('comment_id=') ||
+          href.includes('comment_id%3D') ||
+          href.includes('reply_comment_id=');
+        return !isCommentPermalink && (href.includes(postId) ||
           href.includes(`story_fbid=${postId}`) ||
-          href.includes(`/posts/${postId}`);
+          href.includes(`/posts/${postId}`));
       });
       const profileLinks = Array.from(element.querySelectorAll('a[href]')).filter((link) => {
         const href = link.getAttribute('href') || '';
         const text = (link.innerText || '').trim();
-        return text && href.includes('facebook.com') &&
+        const path = (() => {
+          try { return new URL(href, 'https://www.facebook.com').pathname; }
+          catch (_) { return href; }
+        })();
+        const isGroupUser = /\/groups\/[^/]+\/user\/[^/]+/.test(path);
+        return text && (href.includes('facebook.com') || href.startsWith('/') || isGroupUser) &&
           !href.includes('story.php') &&
           !href.includes('permalink.php') &&
           !href.includes('/posts/') &&
@@ -617,10 +797,26 @@ def _article_diagnostic_summary(
       const interactionMarkers = Array.from(element.querySelectorAll('[data-ad-rendering-role]'))
         .map((node) => node.getAttribute('data-ad-rendering-role'))
         .filter(Boolean);
+      const matchingLinks = links.filter((link) => {
+        const href = link.getAttribute('href') || '';
+        const isCommentPermalink = href.includes('comment_id=') ||
+          href.includes('comment_id%3D') ||
+          href.includes('reply_comment_id=');
+        return href.includes(postId) && !isCommentPermalink;
+      });
+      const commentPermalinkLinks = links.filter((link) => {
+        const href = link.getAttribute('href') || '';
+        return href.includes(postId) && (
+          href.includes('comment_id=') ||
+          href.includes('comment_id%3D') ||
+          href.includes('reply_comment_id=')
+        );
+      });
       return {
         text,
         link_count: links.length,
-        contains_target_post_id: links.some((link) => (link.getAttribute('href') || '').includes(postId)),
+        contains_target_post_id: matchingLinks.length > 0,
+        target_comment_link_count: commentPermalinkLinks.length,
         author_candidates: authorCandidates,
         timestamp_candidates: timestampCandidates,
         interaction_markers: interactionMarkers,
@@ -651,6 +847,7 @@ def _article_diagnostic_summary(
         "text_length": len(text),
         "link_count": int(raw.get("link_count") or 0),
         "contains_target_post_id": bool(raw.get("contains_target_post_id")),
+        "target_comment_link_count": int(raw.get("target_comment_link_count") or 0),
         "author_candidates": list(raw.get("author_candidates") or []),
         "timestamp_candidates": list(raw.get("timestamp_candidates") or []),
         "title_overlap_score": title_overlap_score,
@@ -1162,10 +1359,54 @@ def _extract_author(article: Locator) -> dict[str, str | None]:
                 "profile_url": _normalize_facebook_profile_url(href),
             }
 
+    fallback_name = _extract_author_name_from_action_label(article) or _extract_author_name_from_dialog_label(article)
+    if fallback_name:
+        return {
+            "name": fallback_name,
+            "profile_url": None,
+        }
+
     return {
         "name": None,
         "profile_url": None,
     }
+
+
+def _extract_author_name_from_action_label(article: Locator) -> str | None:
+    nodes = article.locator('[aria-label*="Actions for this post by" i]')
+    for index in range(_safe_count(nodes)):
+        label = nodes.nth(index).get_attribute("aria-label") or ""
+        author = _author_name_from_action_label(label)
+        if author:
+            return author
+    return None
+
+
+def _extract_author_name_from_dialog_label(article: Locator) -> str | None:
+    labels: list[str] = []
+    role = article.get_attribute("role")
+    if role == "dialog":
+        labels.append(article.get_attribute("aria-label") or "")
+    headings = article.locator('h1, h2, h3, [role="heading"]')
+    for index in range(min(max(_safe_count(headings), 0), 5)):
+        text = _safe_inner_text(headings.nth(index))
+        if text:
+            labels.append(text)
+    for label in labels:
+        author = _author_name_from_post_label(label)
+        if author:
+            return author
+    return None
+
+
+def _author_name_from_action_label(label: str) -> str | None:
+    match = re.search(r"Actions for this post by\s+(.+)$", label, flags=re.IGNORECASE)
+    return match.group(1).strip() if match and match.group(1).strip() else None
+
+
+def _author_name_from_post_label(label: str) -> str | None:
+    match = re.match(r"(.+?)[’']s Post$", label.strip())
+    return match.group(1).strip() if match and match.group(1).strip() else None
 
 
 def _extract_content(article: Locator) -> str | None:
@@ -1177,7 +1418,51 @@ def _extract_content(article: Locator) -> str | None:
         text = _safe_inner_text(message, preserve_lines=True)
         if text:
             return text
+    dialog_text = _extract_dialog_visible_post_content(article)
+    if dialog_text:
+        return dialog_text
     return _extract_fallback_content(article)
+
+
+def _extract_dialog_visible_post_content(article: Locator) -> str | None:
+    if article.get_attribute("role") != "dialog" and _safe_count(article.locator('[aria-label*="Actions for this post by" i]')) == 0:
+        return None
+    text = _safe_inner_text(article, preserve_lines=True)
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    author_name = (_extract_author(article).get("name") or "").strip()
+    start_index = 0
+    if author_name:
+        for index, line in enumerate(lines):
+            if line == author_name or author_name in line:
+                start_index = index + 1
+                break
+
+    for line in lines[start_index:]:
+        normalized = " ".join(line.split()).lower()
+        if normalized in {"newest", "all comments", "most relevant", "write an answer…", "write an answer...", "write a comment"}:
+            break
+        if _is_dialog_content_noise(line):
+            continue
+        if _looks_like_post_content(line):
+            return line
+    return None
+
+
+def _is_dialog_content_noise(line: str) -> bool:
+    normalized = " ".join(line.split()).lower()
+    if not normalized:
+        return True
+    if len(normalized) == 1:
+        return True
+    if normalized in {"facebook", "join", "like", "react", "reply", "share", "send", "comment"}:
+        return True
+    if normalized in {"shared with public group"}:
+        return True
+    if parse_metric_count(normalized) is not None and len(normalized) <= 8:
+        return True
+    return False
 
 
 def _extract_fallback_content(article: Locator) -> str | None:
@@ -2003,6 +2288,14 @@ def _collect_failure_diagnostics(
         "role_article_count": _safe_count(page.locator(ROLE_ARTICLE_SELECTOR)),
         "dialog_count": _safe_count(page.locator('[role="dialog"]')),
         "target_link_count": _safe_count(page.locator(f'a[href*="{post_id}"]')),
+        "strong_target_link_count": _safe_count(_target_post_link_locator(page, post_id)),
+        "target_comment_link_count": _safe_count(
+            page.locator(
+                f'a[href*="{post_id}"][href*="comment_id="], '
+                f'a[href*="{post_id}"][href*="comment_id%3D"], '
+                f'a[href*="{post_id}"][href*="reply_comment_id="]'
+            )
+        ),
         "target_id_link_count": _safe_count(page.locator(f'a[href*="{post_id}"]')),
         "story_fbid_link_count": _safe_count(page.locator(f'a[href*="story_fbid={post_id}"]')),
         "posts_path_link_count": _safe_count(page.locator(f'a[href*="/posts/{post_id}"]')),
@@ -2283,9 +2576,12 @@ def _is_single_post_permalink(page: Page, post_id: str) -> bool:
 def _is_facebook_profile_url(href: str) -> bool:
     parsed = urlparse(href)
     host = (parsed.hostname or "").lower()
-    if host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+    if host and host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
         return False
-    first_segment = parsed.path.strip("/").split("/", 1)[0]
+    path_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    if _is_facebook_group_user_path(path_segments):
+        return True
+    first_segment = path_segments[0] if path_segments else ""
     if not first_segment or first_segment in {"permalink.php", "story.php", "posts", "groups", "reel", "watch"}:
         return False
     return True
@@ -2293,7 +2589,22 @@ def _is_facebook_profile_url(href: str) -> bool:
 
 def _normalize_facebook_profile_url(href: str) -> str:
     parsed = urlparse(href)
-    return urlunparse(("https", "www.facebook.com", parsed.path.rstrip("/"), "", "", ""))
+    path_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    if _is_facebook_group_user_path(path_segments):
+        path = "/".join(path_segments[:4])
+    else:
+        path = parsed.path.strip("/")
+    return urlunparse(("https", "www.facebook.com", f"/{path}".rstrip("/"), "", "", ""))
+
+
+def _is_facebook_group_user_path(path_segments: list[str]) -> bool:
+    return (
+        len(path_segments) >= 4
+        and path_segments[0] == "groups"
+        and bool(path_segments[1])
+        and path_segments[2] == "user"
+        and bool(path_segments[3])
+    )
 
 
 def _strip_url_query_and_fragment(href: str) -> str | None:
