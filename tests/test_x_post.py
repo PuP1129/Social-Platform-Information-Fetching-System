@@ -233,7 +233,15 @@ class MainArgumentParsingTests(unittest.TestCase):
         self.assertIsNone(args.x_storage_state)
 
     def test_keyword_search_mode_ignores_storage_state_argument(self) -> None:
-        with patch("src.search.google_pse.search_google_pse", return_value=[]):
+        from src.search.google_pse import GooglePSESearchResponse
+
+        response = GooglePSESearchResponse(
+            results=[],
+            requested_count=5,
+            target_count=5,
+            page_logs=[],
+        )
+        with patch("src.search.google_pse.search_google_pse_with_metadata", return_value=response):
             with patch("main.write_output") as write_output:
                 main.run_search("OpenAI", headless=True, max_results=5)
 

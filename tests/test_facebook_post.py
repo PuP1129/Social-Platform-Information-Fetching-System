@@ -6,16 +6,29 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import main
+from playwright.sync_api import sync_playwright
 from src.extractors.facebook_post import (
     FacebookPostExtractionError,
+    _apply_publish_time_to_result,
     _build_extraction_result,
     _container_score,
+    _collect_failure_diagnostics,
+    _extract_action_count_details,
+    _extract_article_data,
+    _extract_metrics,
+    _find_target_article,
+    _find_target_article_result,
+    _get_visible_text,
     _has_strong_post_semantics,
     _has_post_semantics,
     _looks_like_time_text,
     _metadata_has_post_specific_content,
+    _parse_facebook_publish_time,
+    _post_title_context,
+    _select_best_publish_time_candidate,
     _semantic_score,
     _target_post_link_selector,
+    _visible_publish_time_candidates,
     extract_facebook_post,
 )
 from src.utils.metrics import parse_metric_count
@@ -42,6 +55,14 @@ class FacebookPostValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "playwright marker"):
                 extract_facebook_post(
                     "https://www.facebook.com/story.php?story_fbid=1234567890&id=987654321"
+                )
+
+    def test_valid_group_post_url_is_accepted(self) -> None:
+        with patch("src.extractors.facebook_post.sync_playwright") as sync_playwright:
+            sync_playwright.side_effect = RuntimeError("playwright marker")
+            with self.assertRaisesRegex(RuntimeError, "playwright marker"):
+                extract_facebook_post(
+                    "https://www.facebook.com/groups/booklovers/posts/1234567890/"
                 )
 
     def test_x_url_is_rejected(self) -> None:
@@ -125,6 +146,648 @@ class FacebookTargetSemanticsTests(unittest.TestCase):
         self.assertFalse(_looks_like_time_text("Genshin Impact"))
         self.assertTrue(_looks_like_time_text("May 22"))
 
+    def test_nested_target_containers_select_smallest_semantic_container(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div role="article" id="broad">
+            <div role="article" id="target">
+              <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+              <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">May 30, 2023</a>
+              <div data-ad-comet-preview="message">Post body</div>
+            </div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                target = _find_target_article(page, "123")
+                self.assertIsNotNone(target)
+                self.assertEqual(target.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_broad_dialog_is_not_selected_when_smaller_container_exists(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <button aria-label="Close">Close</button>
+          <div role="article" id="target">
+            <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+            <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">May 30, 2023</a>
+            <div data-ad-preview="message">Post body</div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                target = _find_target_article(page, "123")
+                self.assertIsNotNone(target)
+                self.assertEqual(target.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_selected_container_index_is_recorded(self) -> None:
+        html = """
+        <div role="dialog">
+          <div role="article" id="target">
+            <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+            <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">May 30, 2023</a>
+            <div data-ad-preview="message">Post body</div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "123")
+                self.assertIsNotNone(selection)
+                self.assertIsInstance(selection.candidate_index, int)
+            finally:
+                browser.close()
+
+    def test_title_text_match_fallback_selects_article_without_target_link(self) -> None:
+        html = """
+        <html>
+          <head><title>(1) McDonald's - The McDonald’s and Genshin Impact video game... | Facebook</title></head>
+          <body>
+            <div role="article" id="comment">Great collaboration!</div>
+            <div role="article" id="target">
+              <a href="https://www.facebook.com/McDonalds">McDonald's</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div>The McDonald's and Genshin Impact video game collaboration has arrived with new in-game rewards.</div>
+              <div data-ad-rendering-role="like_button"></div>
+              <div data-ad-rendering-role="comment_button"></div>
+              <div data-ad-rendering-role="share_button"></div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "1035071751957724")
+
+                self.assertIsNotNone(selection)
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
+                self.assertIn(selection.strategy, {"title_text_match", "article_score"})
+            finally:
+                browser.close()
+
+    def test_title_fallback_does_not_take_first_article(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - This is the main post opening... | Facebook</title></head>
+          <body>
+            <div role="article" id="first">This is a short comment.</div>
+            <div role="article" id="target">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div>This is the main post opening with enough text to look like a real public post.</div>
+              <div data-ad-rendering-role="like_button"></div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "999")
+
+                self.assertIsNotNone(selection)
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_title_fallback_rejects_close_scores(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - Same title words appear here... | Facebook</title></head>
+          <body>
+            <div role="article" id="one">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <div>Same title words appear here in one possible post.</div>
+            </div>
+            <div role="article" id="two">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <div>Same title words appear here in another possible post.</div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertIsNone(_find_target_article_result(page, "999"))
+            finally:
+                browser.close()
+
+    def test_short_comment_article_is_not_identified_as_main_post(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - Tiny title... | Facebook</title></head>
+          <body>
+            <div role="article" id="comment">Tiny title</div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertIsNone(_find_target_article_result(page, "999"))
+            finally:
+                browser.close()
+
+    def test_article_candidate_diagnostics_include_scores(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - The target opening text... | Facebook</title></head>
+          <body>
+            <div role="article" id="target">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div>The target opening text is present in this article.</div>
+              <div data-ad-rendering-role="like_button"></div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                diagnostics = _collect_failure_diagnostics(
+                    page,
+                    "999",
+                    "https://www.facebook.com/story.php?story_fbid=999&id=1",
+                )
+
+                self.assertEqual(len(diagnostics["article_candidates"]), 1)
+                candidate = diagnostics["article_candidates"][0]
+                self.assertEqual(candidate["index"], 0)
+                self.assertGreater(candidate["title_overlap_score"], 0)
+                self.assertGreater(candidate["container_score"], 0)
+                self.assertIn("score_reasons", candidate)
+            finally:
+                browser.close()
+
+    def test_message_title_match_selects_ancestor_when_articles_are_empty(self) -> None:
+        html = """
+        <html>
+          <head><title>(1) McDonald's - The McDonald's and Genshin Impact video game... | Facebook</title></head>
+          <body>
+            <div role="article" id="empty-shell"></div>
+            <div id="target">
+              <a href="https://www.facebook.com/McDonalds">McDonald's</a>
+              <a aria-label="Sep 12, 2024">Sep 12, 2024</a>
+              <div data-ad-comet-preview="message">
+                The McDonald's and Genshin Impact video game collaboration is live today.
+              </div>
+              <div>1.7K reactions 124 comments 19 shares</div>
+              <div id="bar">
+                <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+                <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+                <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "1035071751957724")
+
+                self.assertIsNotNone(selection)
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
+                self.assertEqual(selection.strategy, "message_ancestor_title_match")
+                self.assertEqual(selection.message_index, 0)
+            finally:
+                browser.close()
+
+    def test_message_ancestor_path_extracts_full_post_data(self) -> None:
+        html = """
+        <html>
+          <head><title>McDonald's - The McDonald's and Genshin Impact video game... | Facebook</title></head>
+          <body>
+            <div role="article" id="empty-shell"></div>
+            <div id="target">
+              <a href="https://www.facebook.com/McDonalds">McDonald's</a>
+              <a aria-label="Sep 12, 2024">Sep 12, 2024</a>
+              <div data-ad-preview="message">
+                The McDonald's and Genshin Impact video game collaboration is live today.
+              </div>
+              <div>1.7K reactions 124 comments 19 shares</div>
+              <div id="bar">
+                <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+                <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+                <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "1035071751957724")
+                self.assertIsNotNone(selection)
+
+                result = _extract_article_data(
+                    selection.locator,
+                    "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+                    "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+                    "1035071751957724",
+                )
+
+                self.assertEqual(result["author"]["name"], "McDonald's")
+                self.assertIn("Genshin Impact", result["content"])
+                self.assertEqual(result["publish_time"], "2024-09-12")
+                self.assertEqual(result["like_count"], 1700)
+                self.assertEqual(result["comment_count"], 124)
+                self.assertEqual(result["share_count"], 19)
+                self.assertEqual(result["comments"], [])
+                self.assertNotIn("reply_count", result)
+                self.assertEqual(result["collection_status"], "success")
+            finally:
+                browser.close()
+
+    def test_dialog_with_multiple_messages_selects_only_title_match(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - Main title fragment for target post... | Facebook</title></head>
+          <body>
+            <div role="dialog">
+              <div id="comment-wrapper">
+                <a href="https://www.facebook.com/Commenter">Commenter</a>
+                <div data-ad-preview="message">This is only a visible comment.</div>
+              </div>
+              <div id="target">
+                <a href="https://www.facebook.com/Brand">Brand</a>
+                <a aria-label="May 30, 2023">May 30, 2023</a>
+                <div data-ad-comet-preview="message">Main title fragment for target post with additional body text.</div>
+                <div role="button"><div data-ad-rendering-role="like_button"></div><span dir="auto">12</span></div>
+              </div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "999")
+
+                self.assertIsNotNone(selection)
+                self.assertEqual(selection.locator.get_attribute("id"), "target")
+            finally:
+                browser.close()
+
+    def test_ambiguous_message_title_matches_are_rejected(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - Same title words appear here... | Facebook</title></head>
+          <body>
+            <div id="one">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div data-ad-preview="message">Same title words appear here in one possible post.</div>
+              <div data-ad-rendering-role="like_button"></div>
+            </div>
+            <div id="two">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 31, 2023">May 31, 2023</a>
+              <div data-ad-preview="message">Same title words appear here in another possible post.</div>
+              <div data-ad-rendering-role="like_button"></div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertIsNone(_find_target_article_result(page, "999"))
+            finally:
+                browser.close()
+
+    def test_message_ancestor_with_multiple_post_messages_is_rejected(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - Main title fragment for target post... | Facebook</title></head>
+          <body>
+            <section id="too-broad">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div>
+                <div data-ad-preview="message">Main title fragment for target post with additional body text.</div>
+              </div>
+              <div>
+                <div data-ad-preview="message">Another full post body in the same broad ancestor.</div>
+              </div>
+              <div data-ad-rendering-role="like_button"></div>
+            </section>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertIsNone(_find_target_article_result(page, "999"))
+            finally:
+                browser.close()
+
+    def test_message_and_ancestor_diagnostics_are_recorded(self) -> None:
+        html = """
+        <html>
+          <head><title>Brand - The target opening text... | Facebook</title></head>
+          <body>
+            <div id="target">
+              <a href="https://www.facebook.com/Brand">Brand</a>
+              <a aria-label="May 30, 2023">May 30, 2023</a>
+              <div data-ad-comet-preview="message">The target opening text is present in this message.</div>
+              <div data-ad-rendering-role="like_button"></div>
+            </div>
+          </body>
+        </html>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                selection = _find_target_article_result(page, "999")
+                diagnostics = _collect_failure_diagnostics(
+                    page,
+                    "999",
+                    "https://www.facebook.com/story.php?story_fbid=999&id=1",
+                    target_container=selection.locator if selection is not None else None,
+                    selected_container_index=selection.candidate_index if selection is not None else None,
+                    selected_container_strategy=selection.strategy if selection is not None else None,
+                    selected_message_index=selection.message_index if selection is not None else None,
+                    selected_ancestor_depth=selection.ancestor_depth if selection is not None else None,
+                    selected_container_score=selection.score if selection is not None else None,
+                    selected_container_reasons=list(selection.score_reasons) if selection is not None else None,
+                )
+
+                self.assertGreaterEqual(len(diagnostics["message_candidates"]), 1)
+                self.assertGreaterEqual(len(diagnostics["message_ancestor_candidates"]), 1)
+                self.assertIn("selected_message_index", diagnostics)
+                self.assertIn("selected_container_score", diagnostics)
+                self.assertIn("container_rejection_reason", diagnostics)
+            finally:
+                browser.close()
+
+
+class FacebookPublishTimeTests(unittest.TestCase):
+    def test_one_valid_candidate_is_selected(self) -> None:
+        candidate = {
+            "visible_text": "May 30, 2023",
+            "matched_date_pattern": True,
+            "parsed_publish_time": "2023-05-30",
+            "parsed_publish_time_text": "May 30, 2023",
+            "inside_anchor": True,
+            "before_message": True,
+            "near_author": True,
+        }
+
+        self.assertEqual(_select_best_publish_time_candidate([candidate]), candidate)
+
+    def test_invalid_candidates_followed_by_valid_candidate_selects_valid(self) -> None:
+        invalid = {"visible_text": "Facebook", "parsed_publish_time": None, "parsed_publish_time_text": None}
+        valid = {
+            "visible_text": "May 30, 2023",
+            "matched_date_pattern": True,
+            "parsed_publish_time": "2023-05-30",
+            "parsed_publish_time_text": "May 30, 2023",
+            "inside_anchor": True,
+            "before_message": True,
+            "near_author": True,
+        }
+
+        self.assertEqual(_select_best_publish_time_candidate([invalid, invalid, valid]), valid)
+
+    def test_no_valid_candidate_returns_none(self) -> None:
+        self.assertIsNone(
+            _select_best_publish_time_candidate(
+                [{"visible_text": "Facebook", "parsed_publish_time": None, "parsed_publish_time_text": None}]
+            )
+        )
+
+    def test_parse_calendar_date(self) -> None:
+        self.assertEqual(
+            _parse_facebook_publish_time("May 30, 2023"),
+            ("2023-05-30", "May 30, 2023"),
+        )
+
+    def test_parse_datetime_without_inventing_timezone(self) -> None:
+        self.assertEqual(
+            _parse_facebook_publish_time("May 30, 2023 at 3:42 PM"),
+            ("2023-05-30T15:42", "May 30, 2023 at 3:42 PM"),
+        )
+
+    def test_rejects_non_date_text(self) -> None:
+        self.assertEqual(_parse_facebook_publish_time("Genshin Impact"), (None, None))
+        self.assertEqual(_parse_facebook_publish_time("Facebook"), (None, None))
+        self.assertEqual(_parse_facebook_publish_time("5 shares"), (None, None))
+        self.assertEqual(_parse_facebook_publish_time("Version 3.7"), (None, None))
+        self.assertEqual(_parse_facebook_publish_time(""), (None, None))
+
+    def test_relative_time_is_preserved_without_absolute_value(self) -> None:
+        self.assertEqual(_parse_facebook_publish_time("2h"), (None, "2h"))
+
+    def test_visible_text_ignores_hidden_hyphens(self) -> None:
+        html = """
+        <a id="date">
+          <b>M</b><b style="display:none">-</b><b>ay</b>
+          <b> 30</b><b style="display:none">-</b><b>, 2023</b>
+        </a>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertEqual(_get_visible_text(page.locator("#date")), "May 30, 2023")
+            finally:
+                browser.close()
+
+    def test_visible_date_after_many_unrelated_anchors_is_discovered(self) -> None:
+        unrelated = "".join(f'<a href="#">Facebook {index}</a>' for index in range(15))
+        html = f"""
+        <div id="target">
+          <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+          {unrelated}
+          <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">
+            <b>M</b><b style="display:none">-</b><b>ay</b><b> 30</b><b>, 2023</b>
+          </a>
+          <div data-ad-comet-preview="message">Version 3.7 post body</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                scan = _visible_publish_time_candidates(page.locator("#target"))
+                self.assertGreater(scan["scanned_element_count"], 10)
+                self.assertEqual(len(scan["candidates"]), 1)
+                self.assertEqual(scan["candidates"][0]["visible_text"], "May 30, 2023")
+                self.assertTrue(scan["candidates"][0]["before_message"])
+                self.assertEqual(scan["candidates"][0]["parsed_publish_time"], "2023-05-30")
+            finally:
+                browser.close()
+
+    def test_aria_labelledby_hidden_date_is_discovered_from_visible_element(self) -> None:
+        html = """
+        <div id="target">
+          <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+          <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">
+            <span aria-labelledby="date_label"><b>M</b><b style="display:none">-</b><b>ay</b></span>
+          </a>
+          <div data-ad-comet-preview="message">Post body</div>
+        </div>
+        <div hidden style="display:none"><span id="date_label">May 30, 2023</span></div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                scan = _visible_publish_time_candidates(page.locator("#target"))
+                self.assertEqual(len(scan["candidates"]), 1)
+                self.assertEqual(scan["candidates"][0]["strategy"], "aria_labelledby_strict_match")
+                self.assertEqual(scan["candidates"][0]["parsed_publish_time"], "2023-05-30")
+            finally:
+                browser.close()
+
+    def test_selected_candidate_values_appear_in_final_post_dictionary(self) -> None:
+        html = """
+        <div id="target">
+          <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+          <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">
+            <span aria-labelledby="date_label"><b>M</b><b>ay</b></span>
+          </a>
+          <div data-ad-comet-preview="message">Post body</div>
+        </div>
+        <div hidden style="display:none"><span id="date_label">May 30, 2023</span></div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                result = _extract_article_data(
+                    page.locator("#target"),
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "123",
+                )
+
+                self.assertEqual(result["publish_time"], "2023-05-30")
+                self.assertEqual(result["publish_time_text"], "May 30, 2023")
+                self.assertEqual(result["collection_status"], "success")
+                self.assertIsNone(result["error"])
+            finally:
+                browser.close()
+
+    def test_diagnostics_selected_publish_time_matches_final_result(self) -> None:
+        html = """
+        <div id="target">
+          <a href="https://www.facebook.com/Genshinimpact">Genshin Impact</a>
+          <a href="https://www.facebook.com/story.php?story_fbid=123&id=456">
+            <span aria-labelledby="date_label"><b>M</b><b>ay</b></span>
+          </a>
+          <div data-ad-comet-preview="message">Post body</div>
+        </div>
+        <div hidden style="display:none"><span id="date_label">May 30, 2023</span></div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                target = page.locator("#target")
+                result = _extract_article_data(
+                    target,
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "123",
+                )
+                diagnostics = _collect_failure_diagnostics(
+                    page,
+                    "123",
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    target_container=target,
+                    selected_publish_time=result["publish_time"],
+                    selected_publish_time_text=result["publish_time_text"],
+                )
+
+                self.assertEqual(diagnostics["selected_publish_time"], result["publish_time"])
+                self.assertEqual(diagnostics["selected_publish_time_text"], result["publish_time_text"])
+                self.assertTrue(diagnostics["publish_time_selected"])
+            finally:
+                browser.close()
+
+    def test_publish_time_repair_updates_result_status_without_overwrite(self) -> None:
+        result = _build_extraction_result(
+            post_id="123",
+            input_url="https://www.facebook.com/story.php?story_fbid=123&id=456",
+            canonical_url="https://www.facebook.com/story.php?story_fbid=123&id=456",
+            author={"name": "Genshin Impact", "profile_url": "https://www.facebook.com/Genshinimpact"},
+            content="Post body",
+            publish_time=None,
+            publish_time_text=None,
+            like_count=None,
+            comment_count=None,
+            share_count=None,
+            extraction_source="dom",
+            metadata_error=None,
+        )
+
+        repaired = _apply_publish_time_to_result(result, "2023-05-30", "May 30, 2023")
+
+        self.assertEqual(repaired["publish_time"], "2023-05-30")
+        self.assertEqual(repaired["publish_time_text"], "May 30, 2023")
+        self.assertEqual(repaired["collection_status"], "success")
+        self.assertIsNone(repaired["error"])
+
+    def test_diagnostics_limit_after_strict_matching(self) -> None:
+        dates = "".join(f"<span>May {day}, 2023</span>" for day in range(1, 13))
+        html = f"<div id='target'>{dates}<div data-ad-preview='message'>Post body</div></div>"
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                scan = _visible_publish_time_candidates(page.locator("#target"))
+                self.assertEqual(len(scan["candidates"]), 12)
+            finally:
+                browser.close()
+
 
 class FacebookExtractionResultTests(unittest.TestCase):
     def test_all_core_fields_empty_fails(self) -> None:
@@ -181,7 +844,27 @@ class FacebookExtractionResultTests(unittest.TestCase):
         )
 
         self.assertEqual(result["collection_status"], "success")
-        self.assertEqual(result["reply_count"], None)
+        self.assertEqual(result["comment_count"], 2)
+        self.assertNotIn("reply_count", result)
+
+    def test_group_context_type_is_preserved_in_result(self) -> None:
+        result = _build_extraction_result(
+            post_id="123",
+            input_url="https://www.facebook.com/groups/booklovers/posts/123",
+            canonical_url="https://www.facebook.com/groups/booklovers/posts/123",
+            author={"name": "OpenAI", "profile_url": "https://www.facebook.com/openai"},
+            content="Post body",
+            publish_time="2026-06-12T00:00:00Z",
+            publish_time_text=None,
+            like_count=None,
+            comment_count=None,
+            share_count=None,
+            extraction_source="dom",
+            metadata_error=None,
+            context_type="group",
+        )
+
+        self.assertEqual(result["context_type"], "group")
 
     def test_metadata_specific_content_is_partial(self) -> None:
         result = _build_extraction_result(
@@ -213,7 +896,7 @@ class FacebookExtractionResultTests(unittest.TestCase):
             )
         )
 
-    def test_missing_metrics_remain_none_and_reply_is_not_comment_count(self) -> None:
+    def test_missing_metrics_remain_none_and_comment_button_maps_to_comment_count(self) -> None:
         result = _build_extraction_result(
             post_id="123",
             input_url="https://www.facebook.com/openai/posts/123",
@@ -232,7 +915,268 @@ class FacebookExtractionResultTests(unittest.TestCase):
         self.assertIsNone(result["like_count"])
         self.assertEqual(result["comment_count"], 5)
         self.assertIsNone(result["share_count"])
-        self.assertIsNone(result["reply_count"])
+
+
+class FacebookActionMetricTests(unittest.TestCase):
+    def test_rendering_role_buttons_without_summary_do_not_create_counts(self) -> None:
+        html = """
+        <div id="target">
+          <div role="button"><div data-ad-rendering-role="like_button"></div><span dir="auto">1</span></div>
+          <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+          <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertIsNone(like_count)
+                self.assertIsNone(comment_count)
+                self.assertIsNone(share_count)
+            finally:
+                browser.close()
+
+    def test_extracts_metrics_from_action_bar_summary_text(self) -> None:
+        html = """
+        <div id="target">
+          <div>1.7K reactions 124 comments 19 shares</div>
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 1700)
+                self.assertEqual(comment_count, 124)
+                self.assertEqual(share_count, 19)
+            finally:
+                browser.close()
+
+    def test_extracts_ordered_action_bar_numbers_only_when_all_buttons_exist(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div><span dir="auto">1.7K</span></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div><span dir="auto">124</span></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div><span dir="auto">19</span></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 1700)
+                self.assertEqual(comment_count, 124)
+                self.assertEqual(share_count, 19)
+            finally:
+                browser.close()
+
+    def test_summary_parser_supports_large_metric_formats(self) -> None:
+        html = """
+        <div id="target">
+          <div>1.2M reactions 1,234 comments 2M shares</div>
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 1_200_000)
+                self.assertEqual(comment_count, 1_234)
+                self.assertEqual(share_count, 2_000_000)
+            finally:
+                browser.close()
+
+    def test_comment_empty_state_maps_comment_count_to_zero(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+          <div>No comments yet</div>
+          <div>Be the first to comment.</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, comment_count, _ = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(comment_count, 0)
+            finally:
+                browser.close()
+
+    def test_comment_count_remains_none_without_count_or_empty_state(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+          </div>
+          <div>Write a comment...</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, comment_count, _ = _extract_metrics(page.locator("#target"))
+
+                self.assertIsNone(comment_count)
+            finally:
+                browser.close()
+
+    def test_plain_numbers_in_content_are_not_metrics(self) -> None:
+        html = """
+        <div id="target">
+          <div data-ad-preview="message">Version 3.7 launched in 2024 with 2 special events.</div>
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertIsNone(like_count)
+                self.assertIsNone(comment_count)
+                self.assertIsNone(share_count)
+            finally:
+                browser.close()
+
+    def test_comment_empty_state_is_not_post_content(self) -> None:
+        html = """
+        <div id="target">
+          <div>No comments yet</div>
+          <div>Be the first to comment.</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                self.assertIsNone(_extract_article_data(
+                    page.locator("#target"),
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    "123",
+                ).get("content"))
+            except FacebookPostExtractionError:
+                pass
+            finally:
+                browser.close()
+
+    def test_action_count_missing_button_returns_none(self) -> None:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content("<div id='target'></div>")
+                details = _extract_action_count_details(page.locator("#target"), "share_button")
+
+                self.assertFalse(details.button_found)
+                self.assertIsNone(details.raw_text)
+                self.assertIsNone(details.count)
+            finally:
+                browser.close()
+
+    def test_action_count_button_without_parseable_number_returns_none(self) -> None:
+        html = """
+        <div id="target">
+          <div role="button">
+            <div data-ad-rendering-role="like_button"></div>
+            <span dir="auto">Like</span>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                details = _extract_action_count_details(page.locator("#target"), "like_button")
+
+                self.assertTrue(details.button_found)
+                self.assertIsNone(details.raw_text)
+                self.assertIsNone(details.count)
+                self.assertEqual(details.rejection_reason, "button_found_but_no_numeric_summary")
+            finally:
+                browser.close()
+
+    def test_action_count_diagnostics_records_raw_and_parsed_values(self) -> None:
+        html = """
+        <div id="target">
+          <div>1.7K reactions 124 comments 19 shares</div>
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                diagnostics = _collect_failure_diagnostics(
+                    page,
+                    "123",
+                    "https://www.facebook.com/story.php?story_fbid=123&id=456",
+                    target_container=page.locator("#target"),
+                )
+
+                self.assertTrue(diagnostics["like_button_found"])
+                self.assertTrue(diagnostics["action_bar_found"])
+                self.assertEqual(diagnostics["action_bar_match_strategy"], "rendering_role_common_ancestor")
+                self.assertEqual(diagnostics["like_count_raw"], "1.7K reactions 124 comments 19 shares")
+                self.assertEqual(diagnostics["like_count"], 1700)
+                self.assertEqual(diagnostics["like_count_source"], "reaction_summary_text")
+                self.assertTrue(diagnostics["comment_button_found"])
+                self.assertEqual(diagnostics["comment_count_raw"], "1.7K reactions 124 comments 19 shares")
+                self.assertEqual(diagnostics["comment_count"], 124)
+                self.assertEqual(diagnostics["comment_count_source"], "comment_summary_text")
+                self.assertTrue(diagnostics["share_button_found"])
+                self.assertEqual(diagnostics["share_count_raw"], "1.7K reactions 124 comments 19 shares")
+                self.assertEqual(diagnostics["share_count"], 19)
+                self.assertEqual(diagnostics["share_count_source"], "share_summary_text")
+                self.assertGreaterEqual(len(diagnostics["metric_summary_candidates"]), 1)
+            finally:
+                browser.close()
 
 
 class FacebookMainTests(unittest.TestCase):
@@ -281,7 +1225,9 @@ class SharedMetricParserTests(unittest.TestCase):
             "12": 12,
             "1,234": 1234,
             "1.2K": 1200,
+            "1.7K": 1700,
             "3.5M": 3_500_000,
+            "2M": 2_000_000,
             "2B": 2_000_000_000,
             "12 comments": 12,
             "1.2K reactions": 1200,

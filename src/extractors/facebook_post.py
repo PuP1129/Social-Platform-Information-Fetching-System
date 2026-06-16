@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,13 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
+from src.debug.facebook_debug_bundle import (
+    facebook_debug_bundle_dir,
+    save_facebook_debug_bundle,
+    should_save_facebook_debug_bundle,
+    start_facebook_trace,
+    stop_facebook_trace,
+)
 from src.filters.post_url import classify_post_url
 from src.utils.metrics import parse_metric_count
 
@@ -50,11 +59,33 @@ class FacebookPostNotFoundError(FacebookPostExtractionError):
     """Raised when the target Facebook post cannot be confirmed."""
 
 
+@dataclass(frozen=True)
+class TargetContainerSelection:
+    locator: Locator
+    candidate_index: int
+    metrics: dict[str, int | bool]
+    strategy: str
+    message_index: int | None = None
+    ancestor_depth: int | None = None
+    score: int | None = None
+    score_reasons: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ActionCountExtraction:
+    button_found: bool
+    raw_text: str | None
+    count: int | None
+    source: str | None = None
+    rejection_reason: str | None = None
+
+
 def extract_facebook_post(
     url: str,
     headless: bool = False,
     timeout_ms: int = 30_000,
     storage_state_path: str | Path | None = None,
+    save_debug_bundle: bool = False,
 ) -> dict[str, Any]:
     """Open a public Facebook post page and extract the target main post."""
     classified_url = classify_post_url(url)
@@ -65,11 +96,11 @@ def extract_facebook_post(
 
     normalized_storage_state_path = _validate_storage_state_path(storage_state_path)
     post_id = classified_url["post_id"]
-    canonical_url = classified_url["canonical_url"]
     playwright = None
     browser = None
     context = None
     page = None
+    trace_started = False
 
     try:
         playwright = sync_playwright().start()
@@ -78,62 +109,147 @@ def extract_facebook_post(
             context = browser.new_context()
         else:
             context = browser.new_context(storage_state=str(normalized_storage_state_path))
+        trace_error = start_facebook_trace(context)
+        trace_started = trace_error is None
         page = context.new_page()
 
-        _open_post_page(page, canonical_url, timeout_ms)
-        _wait_for_redirects_to_settle(page, timeout_ms)
-        if normalized_storage_state_path is not None and _is_login_url(page.url):
-            raise FacebookLoginRequiredError(
-                "The supplied Facebook authentication state is missing or expired. "
-                "Re-run scripts/create_facebook_storage_state.py."
-            )
-        _wait_for_page_body(page, timeout_ms)
-        _raise_if_unavailable(page)
-
-        target_article = _find_target_article(page, post_id)
-        if target_article is None:
-            metadata_result = _build_metadata_result(page, url, canonical_url, post_id)
-            if metadata_result is not None:
-                return metadata_result
-
-            diagnostics = _collect_failure_diagnostics(page, post_id, url)
-            if diagnostics["login_wall_detected"]:
-                raise FacebookLoginRequiredError(
-                    f"Facebook login wall detected and no target post DOM or useful metadata was available. "
-                    f"Diagnostics: {_diagnostics_summary(diagnostics)}",
-                    diagnostics=diagnostics,
-                )
-            raise FacebookPostNotFoundError(
-                f"Could not confirm the target Facebook post container. "
-                f"Diagnostics: {_diagnostics_summary(diagnostics)}",
-                diagnostics=diagnostics,
-            )
-
-        result = _extract_article_data(target_article, url, canonical_url, post_id)
-        if _has_any_core_field(result):
-            return result
-
-        metadata_result = _build_metadata_result(page, url, canonical_url, post_id)
-        if metadata_result is not None:
-            return metadata_result
-
-        diagnostics = _collect_failure_diagnostics(
-            page,
-            post_id,
-            url,
-            field_locator_presence=_field_locator_presence(target_article),
+        payload = extract_facebook_post_from_page(
+            page=page,
+            url=url,
+            timeout_ms=timeout_ms,
+            authenticated=normalized_storage_state_path is not None,
         )
-        raise FacebookPostExtractionError(
-            f"Target Facebook post matched, but no core post fields could be extracted. "
-            f"Diagnostics: {_diagnostics_summary(diagnostics)}",
-            diagnostics=diagnostics,
+        should_save = should_save_facebook_debug_bundle(
+            str(payload.get("collection_status")),
+            force=save_debug_bundle,
         )
+        bundle_dir = facebook_debug_bundle_dir(index=1, post_id=post_id)
+        if trace_started:
+            trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip" if should_save else None)
+            trace_started = False
+        if should_save:
+            payload.update(save_facebook_debug_bundle(page, bundle_dir, trace_error=trace_error))
+        return payload
+    except Exception as exc:
+        if page is not None and context is not None:
+            bundle_dir = facebook_debug_bundle_dir(index=1, post_id=post_id)
+            if trace_started:
+                trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip")
+                trace_started = False
+            else:
+                trace_error = None
+            diagnostics = exc.diagnostics if isinstance(exc, FacebookPostExtractionError) else None
+            save_facebook_debug_bundle(page, bundle_dir, diagnostics=diagnostics, trace_error=trace_error)
+        raise
     finally:
+        if trace_started and context is not None:
+            stop_facebook_trace(context)
         _close_quietly(page)
         _close_quietly(context)
         _close_quietly(browser)
         if playwright is not None:
             playwright.stop()
+
+
+def extract_facebook_post_from_page(
+    page: Page,
+    url: str,
+    timeout_ms: int = 30_000,
+    authenticated: bool = False,
+) -> dict[str, Any]:
+    """Extract one Facebook post using an existing Playwright page."""
+    classified_url = classify_post_url(url)
+    if classified_url is None:
+        raise ValueError("url must be a supported Facebook post URL.")
+    if classified_url["platform"] != "facebook":
+        raise ValueError("url must be a Facebook post URL, not another platform.")
+
+    post_id = classified_url["post_id"]
+    canonical_url = classified_url["canonical_url"]
+    context_type = classified_url.get("context_type")
+
+    _open_post_page(page, canonical_url, timeout_ms)
+    _wait_for_redirects_to_settle(page, timeout_ms)
+    if authenticated and _is_login_url(page.url):
+        raise FacebookLoginRequiredError(
+            "The supplied Facebook authentication state is missing or expired. "
+            "Re-run scripts/create_facebook_storage_state.py."
+        )
+    _wait_for_page_body(page, timeout_ms)
+    _raise_if_unavailable(page)
+
+    target_selection = _find_target_article_result(page, post_id)
+    if target_selection is None:
+        metadata_result = _build_metadata_result(page, url, canonical_url, post_id, context_type=context_type)
+        if metadata_result is not None:
+            return metadata_result
+
+        diagnostics = _collect_failure_diagnostics(page, post_id, url)
+        if diagnostics["login_wall_detected"]:
+            raise FacebookLoginRequiredError(
+                f"Facebook login wall detected and no target post DOM or useful metadata was available. "
+                f"Diagnostics: {_diagnostics_summary(diagnostics)}",
+                diagnostics=diagnostics,
+            )
+        raise FacebookPostNotFoundError(
+            f"Could not confirm the target Facebook post container. "
+            f"Diagnostics: {_diagnostics_summary(diagnostics)}",
+            diagnostics=diagnostics,
+        )
+
+    target_article = target_selection.locator
+    result = _extract_article_data(target_article, url, canonical_url, post_id, context_type=context_type)
+    if result["publish_time"] is None and result.get("publish_time_text") is None:
+        publish_time, publish_time_text = _extract_publish_time(target_article, post_id)
+        result = _apply_publish_time_to_result(result, publish_time, publish_time_text)
+    diagnostics = _collect_failure_diagnostics(
+        page,
+        post_id,
+        url,
+        field_locator_presence=_field_locator_presence(target_article),
+        target_container=target_article,
+        selected_container_index=target_selection.candidate_index,
+        selected_container_metrics=target_selection.metrics,
+        selected_container_strategy=target_selection.strategy,
+        selected_message_index=target_selection.message_index,
+        selected_ancestor_depth=target_selection.ancestor_depth,
+        selected_container_score=target_selection.score,
+        selected_container_reasons=list(target_selection.score_reasons),
+        selected_publish_time=result.get("publish_time"),
+        selected_publish_time_text=result.get("publish_time_text"),
+    )
+    if result["publish_time"] is None and result.get("publish_time_text") is None:
+        result = _apply_publish_time_to_result(
+            result,
+            _optional_string(diagnostics.get("selected_publish_time")),
+            _optional_string(diagnostics.get("selected_publish_time_text")),
+        )
+    if _has_any_core_field(result):
+        return result
+
+    metadata_result = _build_metadata_result(page, url, canonical_url, post_id, context_type=context_type)
+    if metadata_result is not None:
+        return metadata_result
+
+    diagnostics = _collect_failure_diagnostics(
+        page,
+        post_id,
+        url,
+        field_locator_presence=_field_locator_presence(target_article),
+        target_container=target_article,
+        selected_container_index=target_selection.candidate_index,
+        selected_container_metrics=target_selection.metrics,
+        selected_container_strategy=target_selection.strategy,
+        selected_message_index=target_selection.message_index,
+        selected_ancestor_depth=target_selection.ancestor_depth,
+        selected_container_score=target_selection.score,
+        selected_container_reasons=list(target_selection.score_reasons),
+    )
+    raise FacebookPostExtractionError(
+        f"Target Facebook post matched, but no core post fields could be extracted. "
+        f"Diagnostics: {_diagnostics_summary(diagnostics)}",
+        diagnostics=diagnostics,
+    )
 
 
 def _validate_storage_state_path(storage_state_path: str | Path | None) -> Path | None:
@@ -179,28 +295,55 @@ def _is_login_url(url: str) -> bool:
 
 
 def _find_target_article(page: Page, post_id: str) -> Locator | None:
+    selection = _find_target_article_result(page, post_id)
+    return selection.locator if selection is not None else None
+
+
+def _find_target_article_result(page: Page, post_id: str) -> TargetContainerSelection | None:
+    title_context = _post_title_context(_safe_page_title(page))
     target_links = _target_post_link_locator(page, post_id)
-    best_container = None
-    best_score = -1
+    best_selection = None
+    best_score: tuple[int, int, int, int, int, int] | None = None
+    candidate_index = 0
     for selector in TARGET_CONTAINER_SELECTORS:
         containers = page.locator(selector).filter(has=target_links)
         for index in range(_safe_count(containers)):
             container = containers.nth(index)
-            field_presence = _field_locator_presence(container)
-            if not _has_post_semantics(field_presence):
+            metrics = _container_metrics(container, post_id)
+            if not _is_valid_target_container(metrics):
+                candidate_index += 1
                 continue
-            score = _container_score(field_presence)
-            if score > best_score:
-                best_container = container
+            score = _container_selection_score(metrics)
+            if best_score is None or score > best_score:
+                best_selection = TargetContainerSelection(
+                    locator=container,
+                    candidate_index=candidate_index,
+                    metrics=metrics,
+                    strategy="smallest_semantic_target_container",
+                )
                 best_score = score
+            candidate_index += 1
 
-    if best_container is not None:
-        return best_container
+    if best_selection is not None:
+        return best_selection
 
     if _is_single_post_permalink(page, post_id):
         fallback = _single_semantic_post_container(page)
         if fallback is not None:
-            return fallback
+            return TargetContainerSelection(
+                locator=fallback,
+                candidate_index=0,
+                metrics=_container_metrics(fallback, post_id),
+                strategy="single_semantic_post_container",
+            )
+
+    title_selection = _find_article_by_title_context(page, post_id, title_context)
+    if title_selection is not None:
+        return title_selection
+
+    message_selection = _find_message_ancestor_by_title_context(page, post_id, title_context)
+    if message_selection is not None:
+        return message_selection
 
     return None
 
@@ -248,15 +391,613 @@ def _container_score(field_presence: dict[str, bool]) -> int:
     return core_score * 10 + metric_score
 
 
+def _container_metrics(container: Locator, post_id: str) -> dict[str, int | bool]:
+    script = """
+    (element, postId) => {
+      const messageSelector = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
+      const targetLinks = Array.from(element.querySelectorAll('a[href]')).filter((link) => {
+        const href = link.getAttribute('href') || '';
+        return href.includes(postId) ||
+          href.includes(`story_fbid=${postId}`) ||
+          href.includes(`/posts/${postId}`);
+      });
+      const profileLinks = Array.from(element.querySelectorAll('a[href]')).filter((link) => {
+        const href = link.getAttribute('href') || '';
+        const text = (link.innerText || '').trim();
+        return text && href.includes('facebook.com') &&
+          !href.includes('story.php') &&
+          !href.includes('permalink.php') &&
+          !href.includes('/posts/') &&
+          !href.includes('/watch/') &&
+          !href.includes('/reel/');
+      });
+      let depth = 0;
+      let current = element;
+      while (current && current.parentElement) {
+        depth += 1;
+        current = current.parentElement;
+      }
+      return {
+        targetLinkCount: targetLinks.length,
+        messageCount: element.querySelectorAll(messageSelector).length,
+        authorCount: profileLinks.length,
+        roleArticleCount: element.querySelectorAll('[role="article"]').length,
+        descendantCount: element.querySelectorAll('*').length,
+        textLength: (element.innerText || '').length,
+        depth,
+        isDialog: element.getAttribute('role') === 'dialog',
+      };
+    }
+    """
+    defaults: dict[str, int | bool] = {
+        "targetLinkCount": 0,
+        "messageCount": 0,
+        "authorCount": 0,
+        "roleArticleCount": 0,
+        "descendantCount": 1_000_000,
+        "textLength": 1_000_000,
+        "depth": 0,
+        "isDialog": False,
+    }
+    try:
+        value = container.evaluate(script, post_id)
+    except PlaywrightError:
+        return defaults
+    if not isinstance(value, dict):
+        return defaults
+    return {**defaults, **value}
+
+
+def _is_valid_target_container(metrics: dict[str, int | bool]) -> bool:
+    if int(metrics["targetLinkCount"]) <= 0:
+        return False
+    if int(metrics["messageCount"]) > 1:
+        return False
+    if int(metrics["messageCount"]) == 1 and int(metrics["authorCount"]) >= 1:
+        return True
+    return int(metrics["messageCount"]) == 1
+
+
+def _container_selection_score(metrics: dict[str, int | bool]) -> tuple[int, int, int, int, int, int]:
+    return (
+        1 if int(metrics["messageCount"]) == 1 else 0,
+        1 if int(metrics["authorCount"]) >= 1 and int(metrics["messageCount"]) == 1 else 0,
+        int(metrics["depth"]),
+        0 if bool(metrics["isDialog"]) else 1,
+        -int(metrics["descendantCount"]),
+        -int(metrics["textLength"]),
+    )
+
+
+def _find_article_by_title_context(
+    page: Page,
+    post_id: str,
+    title_context: dict[str, str | None],
+) -> TargetContainerSelection | None:
+    title_fragment = title_context.get("content_fragment")
+    if not title_fragment:
+        return None
+
+    articles = page.locator(ROLE_ARTICLE_SELECTOR)
+    summaries: list[dict[str, Any]] = []
+    for index in range(_safe_count(articles)):
+        article = articles.nth(index)
+        summary = _article_diagnostic_summary(article, index, post_id, title_context)
+        summaries.append(summary)
+
+    if not summaries:
+        return None
+
+    sorted_summaries = sorted(summaries, key=lambda item: item["container_score"], reverse=True)
+    best = sorted_summaries[0]
+    second_score = sorted_summaries[1]["container_score"] if len(sorted_summaries) > 1 else 0
+    best_score = int(best["container_score"])
+    has_clear_title_match = float(best["title_overlap_score"]) >= 0.65
+    has_clear_margin = best_score - int(second_score) >= 3
+
+    if best_score < 8 or not has_clear_title_match or not has_clear_margin:
+        return None
+
+    selected_index = int(best["index"])
+    selected = articles.nth(selected_index)
+    return TargetContainerSelection(
+        locator=selected,
+        candidate_index=selected_index,
+        metrics=_container_metrics(selected, post_id),
+        strategy="title_text_match" if float(best["title_overlap_score"]) >= 0.9 else "article_score",
+    )
+
+
+def _find_message_ancestor_by_title_context(
+    page: Page,
+    post_id: str,
+    title_context: dict[str, str | None],
+) -> TargetContainerSelection | None:
+    title_fragment = title_context.get("content_fragment")
+    if not title_fragment:
+        return None
+
+    messages = _message_locator(page)
+    message_summaries = _message_candidate_diagnostics(page, title_context)
+    matching_messages = [
+        summary
+        for summary in message_summaries
+        if float(summary["title_overlap_score"]) >= 0.65
+        and bool(summary["contains_title_fragment"])
+        and int(summary["text_length"]) >= 20
+    ]
+    if not matching_messages:
+        return None
+
+    matching_messages.sort(key=lambda item: (float(item["title_overlap_score"]), int(item["text_length"])), reverse=True)
+    best_message = matching_messages[0]
+    if len(matching_messages) > 1:
+        second_message = matching_messages[1]
+        if float(best_message["title_overlap_score"]) - float(second_message["title_overlap_score"]) < 0.2:
+            return None
+
+    message_index = int(best_message["index"])
+    message = messages.nth(message_index)
+    ancestor_summaries = _message_ancestor_diagnostics_for_message(message, message_index, title_context)
+    valid_ancestors = [
+        summary
+        for summary in ancestor_summaries
+        if bool(summary.get("is_valid_candidate"))
+    ]
+    if not valid_ancestors:
+        return None
+
+    valid_ancestors.sort(
+        key=lambda item: (
+            int(item["container_score"]),
+            int(item["depth"]),
+            -int(item["descendant_count"]),
+            -int(item["text_length"]),
+        ),
+        reverse=True,
+    )
+    best_ancestor = valid_ancestors[0]
+
+    selected_depth = int(best_ancestor["depth"])
+    selected = message.locator("xpath=ancestor::*").nth(selected_depth - 1)
+    metrics = _container_metrics(selected, post_id)
+    return TargetContainerSelection(
+        locator=selected,
+        candidate_index=message_index,
+        metrics=metrics,
+        strategy="message_ancestor_title_match",
+        message_index=message_index,
+        ancestor_depth=selected_depth,
+        score=int(best_ancestor["container_score"]),
+        score_reasons=tuple(str(reason) for reason in best_ancestor.get("score_reasons", [])),
+    )
+
+
+def _post_title_context(page_title: str | None) -> dict[str, str | None]:
+    if not page_title:
+        return {"author": None, "content_fragment": None}
+
+    title = re.sub(r"^\(\d+\)\s*", "", page_title).strip()
+    title = re.sub(r"\s*\|\s*Facebook\s*$", "", title, flags=re.IGNORECASE).strip()
+    author = None
+    content_fragment = title
+    if " - " in title:
+        author, content_fragment = title.split(" - ", 1)
+    content_fragment = re.sub(r"\.\.\.$", "", content_fragment).strip()
+    content_fragment = re.sub(r"…$", "", content_fragment).strip()
+    return {
+        "author": author.strip() if author else None,
+        "content_fragment": content_fragment or None,
+    }
+
+
+def _article_diagnostic_summary(
+    article: Locator,
+    index: int,
+    post_id: str,
+    title_context: dict[str, str | None],
+) -> dict[str, Any]:
+    script = """
+    (element, postId) => {
+      const text = (element.innerText || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+      const links = Array.from(element.querySelectorAll('a[href]'));
+      const authorCandidates = links
+        .map((link) => (link.innerText || '').replace(/\\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 5);
+      const timestampCandidates = Array.from(element.querySelectorAll('time, a[aria-label], [aria-labelledby], [title]'))
+        .map((node) => (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('title') ||
+          node.innerText ||
+          ''
+        ).replace(/\\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 5);
+      const interactionMarkers = Array.from(element.querySelectorAll('[data-ad-rendering-role]'))
+        .map((node) => node.getAttribute('data-ad-rendering-role'))
+        .filter(Boolean);
+      return {
+        text,
+        link_count: links.length,
+        contains_target_post_id: links.some((link) => (link.getAttribute('href') || '').includes(postId)),
+        author_candidates: authorCandidates,
+        timestamp_candidates: timestampCandidates,
+        interaction_markers: interactionMarkers,
+      };
+    }
+    """
+    defaults = {
+        "text": "",
+        "link_count": 0,
+        "contains_target_post_id": False,
+        "author_candidates": [],
+        "timestamp_candidates": [],
+        "interaction_markers": [],
+    }
+    try:
+        raw = article.evaluate(script, post_id)
+    except PlaywrightError:
+        raw = defaults
+    if not isinstance(raw, dict):
+        raw = defaults
+
+    text = str(raw.get("text") or "")
+    title_overlap_score = _title_overlap_score(text, title_context.get("content_fragment"))
+    score, reasons = _score_article_candidate(raw, title_context, title_overlap_score)
+    return {
+        "index": index,
+        "text_preview": text[:240],
+        "text_length": len(text),
+        "link_count": int(raw.get("link_count") or 0),
+        "contains_target_post_id": bool(raw.get("contains_target_post_id")),
+        "author_candidates": list(raw.get("author_candidates") or []),
+        "timestamp_candidates": list(raw.get("timestamp_candidates") or []),
+        "title_overlap_score": title_overlap_score,
+        "interaction_markers": list(raw.get("interaction_markers") or []),
+        "container_score": score,
+        "score_reasons": reasons,
+    }
+
+
+def _message_locator(page: Page) -> Locator:
+    return page.locator(", ".join(MESSAGE_SELECTORS))
+
+
+def _message_candidate_diagnostics(
+    page: Page,
+    title_context: dict[str, str | None],
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    messages = _message_locator(page)
+    summaries: list[dict[str, Any]] = []
+    for index in range(min(max(_safe_count(messages), 0), limit)):
+        summaries.append(_message_diagnostic_summary(messages.nth(index), index, title_context))
+    return summaries
+
+
+def _message_diagnostic_summary(
+    message: Locator,
+    index: int,
+    title_context: dict[str, str | None],
+) -> dict[str, Any]:
+    text = _safe_inner_text(message, preserve_lines=True) or ""
+    normalized_text = _normalize_match_text(text)
+    title_fragment = title_context.get("content_fragment")
+    normalized_title = _normalize_match_text(title_fragment)
+    author = title_context.get("author")
+    normalized_author = _normalize_match_text(author)
+    title_overlap_score = _title_overlap_score(text, title_fragment)
+    try:
+        visible = message.is_visible(timeout=500)
+    except PlaywrightError:
+        visible = False
+    return {
+        "index": index,
+        "text_preview": " ".join(text.split())[:240],
+        "normalized_text_preview": normalized_text[:240],
+        "text_length": len(text),
+        "visible": visible,
+        "title_overlap_score": title_overlap_score,
+        "contains_title_fragment": bool(normalized_title and normalized_title in normalized_text),
+        "contains_author_name": bool(normalized_author and normalized_author in normalized_text),
+    }
+
+
+def _message_ancestor_candidate_diagnostics(
+    page: Page,
+    title_context: dict[str, str | None],
+    limit_messages: int = 8,
+    limit_depth: int = 12,
+) -> list[dict[str, Any]]:
+    messages = _message_locator(page)
+    all_summaries: list[dict[str, Any]] = []
+    max_messages = min(max(_safe_count(messages), 0), limit_messages)
+    for message_index in range(max_messages):
+        message_summary = _message_diagnostic_summary(messages.nth(message_index), message_index, title_context)
+        if (
+            float(message_summary["title_overlap_score"]) < 0.35
+            and not bool(message_summary["contains_title_fragment"])
+        ):
+            continue
+        all_summaries.extend(
+            _message_ancestor_diagnostics_for_message(
+                messages.nth(message_index),
+                message_index,
+                title_context,
+                limit_depth=limit_depth,
+            )
+        )
+    return all_summaries
+
+
+def _message_ancestor_diagnostics_for_message(
+    message: Locator,
+    message_index: int,
+    title_context: dict[str, str | None],
+    limit_depth: int = 12,
+) -> list[dict[str, Any]]:
+    ancestors = message.locator("xpath=ancestor::*")
+    summaries: list[dict[str, Any]] = []
+    for ancestor_index in range(min(max(_safe_count(ancestors), 0), limit_depth)):
+        depth = ancestor_index + 1
+        ancestor = ancestors.nth(ancestor_index)
+        summary = _message_ancestor_diagnostic_summary(ancestor, message_index, depth, title_context)
+        summaries.append(summary)
+    return summaries
+
+
+def _message_ancestor_diagnostic_summary(
+    ancestor: Locator,
+    message_index: int,
+    depth: int,
+    title_context: dict[str, str | None],
+) -> dict[str, Any]:
+    script = """
+    (element) => {
+      const messageSelector = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
+      const normalizedText = (element.innerText || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+      const timestampCandidates = Array.from(element.querySelectorAll('time, a[aria-label], [aria-labelledby], [title]'))
+        .map((node) => (
+          node.getAttribute('aria-label') ||
+          node.getAttribute('title') ||
+          node.innerText ||
+          ''
+        ).replace(/\\s+/g, ' ').trim())
+        .filter(Boolean)
+        .slice(0, 5);
+      return {
+        tag_name: element.tagName.toLowerCase(),
+        role: element.getAttribute('role'),
+        text: normalizedText,
+        descendant_count: element.querySelectorAll('*').length,
+        message_count: element.querySelectorAll(messageSelector).length,
+        timestamp_candidate_count: timestampCandidates.length,
+        timestamp_candidates: timestampCandidates,
+        reaction_marker_count: element.querySelectorAll('[data-ad-rendering-role="like_button"]').length,
+        comment_marker_count: element.querySelectorAll('[data-ad-rendering-role="comment_button"]').length,
+        share_marker_count: element.querySelectorAll('[data-ad-rendering-role="share_button"]').length,
+      };
+    }
+    """
+    defaults = {
+        "tag_name": "",
+        "role": None,
+        "text": "",
+        "descendant_count": 1_000_000,
+        "message_count": 0,
+        "timestamp_candidate_count": 0,
+        "timestamp_candidates": [],
+        "reaction_marker_count": 0,
+        "comment_marker_count": 0,
+        "share_marker_count": 0,
+    }
+    try:
+        raw = ancestor.evaluate(script)
+    except PlaywrightError:
+        raw = defaults
+    if not isinstance(raw, dict):
+        raw = defaults
+
+    text = str(raw.get("text") or "")
+    title_overlap_score = _title_overlap_score(text, title_context.get("content_fragment"))
+    normalized_text = _normalize_match_text(text)
+    normalized_author = _normalize_match_text(title_context.get("author"))
+    author_match = bool(normalized_author and normalized_author in normalized_text)
+    score, reasons, is_valid = _score_message_ancestor(raw, author_match, title_overlap_score)
+    return {
+        "message_index": message_index,
+        "depth": depth,
+        "tag_name": str(raw.get("tag_name") or ""),
+        "role": raw.get("role"),
+        "text_preview": text[:240],
+        "text_length": len(text),
+        "descendant_count": int(raw.get("descendant_count") or 0),
+        "message_count": int(raw.get("message_count") or 0),
+        "author_match": author_match,
+        "timestamp_candidate_count": int(raw.get("timestamp_candidate_count") or 0),
+        "timestamp_candidates": list(raw.get("timestamp_candidates") or []),
+        "reaction_marker_count": int(raw.get("reaction_marker_count") or 0),
+        "comment_marker_count": int(raw.get("comment_marker_count") or 0),
+        "share_marker_count": int(raw.get("share_marker_count") or 0),
+        "title_overlap_score": title_overlap_score,
+        "container_score": score,
+        "score_reasons": reasons,
+        "is_valid_candidate": is_valid,
+    }
+
+
+def _score_message_ancestor(
+    raw: dict[str, Any],
+    author_match: bool,
+    title_overlap_score: float,
+) -> tuple[int, list[str], bool]:
+    score = 0
+    reasons: list[str] = []
+    text = str(raw.get("text") or "")
+    message_count = int(raw.get("message_count") or 0)
+    descendant_count = int(raw.get("descendant_count") or 0)
+    timestamp_count = int(raw.get("timestamp_candidate_count") or 0)
+    reaction_count = int(raw.get("reaction_marker_count") or 0)
+    comment_count = int(raw.get("comment_marker_count") or 0)
+    share_count = int(raw.get("share_marker_count") or 0)
+    tag_name = str(raw.get("tag_name") or "").lower()
+
+    if title_overlap_score >= 0.9:
+        score += 8
+        reasons.append("strong_message_title_match")
+    elif title_overlap_score >= 0.65:
+        score += 5
+        reasons.append("partial_message_title_match")
+    if message_count == 1:
+        score += 3
+        reasons.append("single_message_container")
+    else:
+        score -= 8
+        reasons.append("multiple_or_missing_messages")
+    if author_match:
+        score += 3
+        reasons.append("title_author_match")
+    if timestamp_count > 0:
+        score += 3
+        reasons.append("timestamp_candidate_present")
+    marker_score = 0
+    if reaction_count > 0:
+        marker_score += 1
+    if comment_count > 0:
+        marker_score += 1
+    if share_count > 0:
+        marker_score += 1
+    if marker_score:
+        score += marker_score
+        reasons.append("interaction_markers_present")
+    if 80 <= len(text) <= 6_000:
+        score += 1
+        reasons.append("reasonable_text_length")
+    if len(text) < 40:
+        score -= 4
+        reasons.append("too_short_for_main_post")
+    if descendant_count > 2_500 or len(text) > 8_000 or tag_name in {"html", "body"}:
+        score -= 4
+        reasons.append("too_broad_for_single_post")
+
+    has_semantic_signal = author_match or timestamp_count > 0 or marker_score > 0
+    is_valid = (
+        score >= 12
+        and message_count == 1
+        and has_semantic_signal
+        and descendant_count <= 2_500
+        and len(text) <= 8_000
+        and tag_name not in {"html", "body"}
+    )
+    return score, reasons, is_valid
+
+
+def _message_ancestor_rejection_reason(
+    message_candidates: list[dict[str, Any]],
+    ancestor_candidates: list[dict[str, Any]],
+) -> str | None:
+    if not message_candidates:
+        return "no_message_candidates"
+    matching_messages = [
+        candidate
+        for candidate in message_candidates
+        if float(candidate["title_overlap_score"]) >= 0.65 and bool(candidate["contains_title_fragment"])
+    ]
+    if not matching_messages:
+        return "no_message_matches_title"
+    if len(matching_messages) > 1:
+        sorted_messages = sorted(
+            matching_messages,
+            key=lambda item: float(item["title_overlap_score"]),
+            reverse=True,
+        )
+        if float(sorted_messages[0]["title_overlap_score"]) - float(sorted_messages[1]["title_overlap_score"]) < 0.2:
+            return "ambiguous_message_matches"
+    if ancestor_candidates and not any(bool(candidate.get("is_valid_candidate")) for candidate in ancestor_candidates):
+        return "no_valid_message_ancestor"
+    return None
+
+
+def _score_article_candidate(
+    raw: dict[str, Any],
+    title_context: dict[str, str | None],
+    title_overlap_score: float,
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    text = str(raw.get("text") or "")
+    normalized_text = _normalize_match_text(text)
+    author = title_context.get("author")
+
+    if title_overlap_score >= 0.9:
+        score += 8
+        reasons.append("strong_title_text_match")
+    elif title_overlap_score >= 0.65:
+        score += 5
+        reasons.append("partial_title_text_match")
+    if author and _normalize_match_text(author) in normalized_text:
+        score += 2
+        reasons.append("title_author_match")
+    if raw.get("timestamp_candidates"):
+        score += 2
+        reasons.append("timestamp_candidate_present")
+    interaction_markers = set(raw.get("interaction_markers") or [])
+    if interaction_markers.intersection({"like_button", "comment_button", "share_button"}):
+        score += 2
+        reasons.append("interaction_markers_present")
+    if 80 <= len(text) <= 5_000:
+        score += 1
+        reasons.append("reasonable_text_length")
+    if len(text) < 40:
+        score -= 4
+        reasons.append("too_short_for_main_post")
+    if any(marker in normalized_text for marker in ("sponsored", "suggested for you", "people you may know")):
+        score -= 4
+        reasons.append("recommendation_or_navigation_text")
+
+    return score, reasons
+
+
+def _title_overlap_score(article_text: str, title_fragment: str | None) -> float:
+    if not title_fragment:
+        return 0.0
+    normalized_article = _normalize_match_text(article_text)
+    normalized_title = _normalize_match_text(title_fragment)
+    if not normalized_title:
+        return 0.0
+    if normalized_title in normalized_article:
+        return 1.0
+    title_words = [word for word in normalized_title.split() if len(word) > 2]
+    if not title_words:
+        return 0.0
+    article_words = set(normalized_article.split())
+    matched = sum(1 for word in title_words if word in article_words)
+    return matched / len(title_words)
+
+
+def _normalize_match_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    normalized = value.lower()
+    normalized = normalized.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    normalized = normalized.replace("…", " ")
+    normalized = re.sub(r"\.\.\.", " ", normalized)
+    normalized = re.sub(r"[^\w\s']", " ", normalized, flags=re.UNICODE)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def _extract_article_data(
     article: Locator,
     input_url: str,
     canonical_url: str,
     post_id: str,
+    context_type: str | None = None,
 ) -> dict[str, Any]:
     author = _extract_author(article)
     content = _extract_content(article)
-    publish_time, publish_time_text = _extract_publish_time(article)
+    publish_time, publish_time_text = _extract_publish_time(article, post_id)
     like_count, comment_count, share_count = _extract_metrics(article)
 
     return _build_extraction_result(
@@ -272,6 +1013,7 @@ def _extract_article_data(
         share_count=share_count,
         extraction_source="dom",
         metadata_error=None,
+        context_type=context_type,
     )
 
 
@@ -288,6 +1030,7 @@ def _build_extraction_result(
     share_count: int | None,
     extraction_source: str,
     metadata_error: str | None,
+    context_type: str | None = None,
 ) -> dict[str, Any]:
     has_author = bool(author["name"] or author["profile_url"])
     has_content = bool(content)
@@ -317,7 +1060,6 @@ def _build_extraction_result(
         "author": author,
         "content": content,
         "publish_time": publish_time,
-        "reply_count": None,
         "like_count": like_count,
         "share_count": share_count,
         "comment_count": comment_count,
@@ -327,9 +1069,47 @@ def _build_extraction_result(
         "extraction_source": extraction_source,
         "error": error,
     }
+    if context_type:
+        result["context_type"] = context_type
     if publish_time_text:
         result["publish_time_text"] = publish_time_text
     return result
+
+
+def _apply_publish_time_to_result(
+    result: dict[str, Any],
+    publish_time: str | None,
+    publish_time_text: str | None,
+) -> dict[str, Any]:
+    if publish_time is None and publish_time_text is None:
+        return result
+
+    updated = dict(result)
+    updated["publish_time"] = publish_time
+    if publish_time_text:
+        updated["publish_time_text"] = publish_time_text
+    else:
+        updated.pop("publish_time_text", None)
+
+    has_author = bool(updated["author"]["name"] or updated["author"]["profile_url"])
+    has_content = bool(updated["content"])
+    has_publish_time = bool(updated["publish_time"] or updated.get("publish_time_text"))
+
+    if updated["extraction_source"] == "dom" and has_author and has_content and has_publish_time:
+        updated["collection_status"] = "success"
+        updated["error"] = None
+        return updated
+
+    missing = []
+    if not has_author:
+        missing.append("author")
+    if not has_content:
+        missing.append("content")
+    if not has_publish_time:
+        missing.append("publish_time")
+    updated["collection_status"] = "partial"
+    updated["error"] = f"Missing core field(s): {', '.join(missing)}." if missing else updated.get("error")
+    return updated
 
 
 def _build_metadata_result(
@@ -337,6 +1117,7 @@ def _build_metadata_result(
     input_url: str,
     canonical_url: str,
     post_id: str,
+    context_type: str | None = None,
 ) -> dict[str, Any] | None:
     metadata = _page_metadata(page)
     if not _metadata_has_post_specific_content(metadata):
@@ -363,6 +1144,7 @@ def _build_metadata_result(
         share_count=None,
         extraction_source="page_metadata",
         metadata_error="Full Facebook post DOM was unavailable.",
+        context_type=context_type,
     )
 
 
@@ -432,6 +1214,8 @@ def _looks_like_post_content(text: str) -> bool:
     blocked_phrases = (
         "all reactions:",
         "active",
+        "no comments yet",
+        "be the first to comment",
         "view more comments",
         "most relevant",
         "write a comment",
@@ -458,46 +1242,662 @@ def _click_see_more_in_message(article: Locator) -> None:
                 return
 
 
-def _extract_publish_time(article: Locator) -> tuple[str | None, str | None]:
+def _extract_publish_time(article: Locator, post_id: str) -> tuple[str | None, str | None]:
+    strict_candidates = _visible_publish_time_candidates(article)
+    best_candidate = _select_best_publish_time_candidate(strict_candidates["candidates"])
+    if best_candidate is not None:
+        return (
+            _optional_string(best_candidate.get("parsed_publish_time")),
+            _optional_string(best_candidate.get("parsed_publish_time_text")),
+        )
+
     time_element = article.locator("time").first
     if time_element.count() > 0:
-        for attr_name in ("datetime", "title", "aria-label"):
-            value = time_element.get_attribute(attr_name)
-            if value:
-                return value.strip(), None
-        text = _safe_inner_text(time_element)
-        if text:
-            return None, text
+        parsed = _parse_candidate_publish_time(time_element)
+        if parsed != (None, None):
+            return parsed
 
-    time_links = article.locator('a[href*="/posts/"], a[href*="story_fbid"], a[href*="permalink.php"]')
-    for index in range(time_links.count()):
-        link = time_links.nth(index)
-        label = link.get_attribute("aria-label")
-        if label and _looks_like_time_text(label):
-            return None, label.strip()
-        text = _safe_inner_text(link)
-        if text and _looks_like_time_text(text):
-            return None, text
+    candidates = _publish_time_candidate_locators(article, post_id)
+    best_relative: tuple[str | None, str | None] = (None, None)
+    for index in range(_safe_count(candidates)):
+        parsed = _parse_candidate_publish_time(candidates.nth(index))
+        if parsed[0]:
+            return parsed
+        if parsed[1] and best_relative == (None, None):
+            best_relative = parsed
+
+    return best_relative
+
+
+def _select_best_publish_time_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    valid_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate.get("parsed_publish_time") is not None
+        or candidate.get("parsed_publish_time_text") is not None
+    ]
+    if not valid_candidates:
+        return None
+    return sorted(valid_candidates, key=_date_candidate_sort_key, reverse=True)[0]
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(value)
+
+
+def _visible_publish_time_candidates(article: Locator) -> dict[str, Any]:
+    script = """
+    (container) => {
+      const messageSelector = '[data-ad-preview="message"], [data-ad-comet-preview="message"]';
+      const blockedSelector = [
+        messageSelector,
+        '[aria-label*="Like" i]',
+        '[aria-label*="Comment" i]',
+        '[aria-label*="Share" i]',
+        '[role="navigation"]',
+        '[aria-label="Close"]'
+      ].join(',');
+      const datePatterns = [
+        /^[A-Z][a-z]+ \\d{1,2}, \\d{4}$/,
+        /^[A-Z][a-z]{2} \\d{1,2}, \\d{4}$/,
+        /^[A-Z][a-z]+ \\d{1,2}, \\d{4} at \\d{1,2}:\\d{2} [AP]M$/,
+        /^[A-Z][a-z]{2} \\d{1,2}, \\d{4} at \\d{1,2}:\\d{2} [AP]M$/,
+        /^\\d{4}-\\d{2}-\\d{2}$/,
+        /^\\d+\\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)$/i,
+        /^Yesterday$/i
+      ];
+      const isHidden = (element) => {
+        let current = element;
+        while (current && current.nodeType === Node.ELEMENT_NODE) {
+          const style = window.getComputedStyle(current);
+          if (
+            current.getAttribute('aria-hidden') === 'true' ||
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            style.opacity === '0'
+          ) {
+            return true;
+          }
+          current = current.parentElement;
+        }
+        return false;
+      };
+      const normalizedText = (element) =>
+        (element.innerText || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+      const labelledText = (element) => {
+        const ids = (element.getAttribute('aria-labelledby') || '')
+          .split(/\\s+/)
+          .map((id) => id.trim())
+          .filter(Boolean);
+        const parts = [];
+        for (const id of ids) {
+          const label = document.getElementById(id);
+          if (label) {
+            parts.push((label.textContent || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim());
+          }
+        }
+        return parts.join(' ').replace(/\\s+/g, ' ').trim();
+      };
+      const message = container.querySelector(messageSelector);
+      const elements = Array.from(container.querySelectorAll('*'));
+      const candidates = [];
+      let scanned = 0;
+      for (const element of elements) {
+        if (isHidden(element) || element.closest(blockedSelector)) {
+          continue;
+        }
+        const textOptions = [
+          { text: normalizedText(element), strategy: 'visible_descendant_strict_match' },
+          { text: (element.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim(), strategy: 'aria_label_strict_match' },
+          { text: (element.getAttribute('title') || '').replace(/\\s+/g, ' ').trim(), strategy: 'title_strict_match' },
+          { text: labelledText(element), strategy: 'aria_labelledby_strict_match' },
+        ].filter((option) => option.text && option.text.length <= 80);
+        if (textOptions.length === 0) {
+          continue;
+        }
+        scanned += 1;
+        for (const option of textOptions) {
+          if (!datePatterns.some((pattern) => pattern.test(option.text))) {
+            continue;
+          }
+          const relation = message ? (element.compareDocumentPosition(message) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0 : false;
+          candidates.push({
+            strategy: option.strategy,
+            visible_text: option.text,
+            tag_name: element.tagName,
+            inside_anchor: Boolean(element.closest('a')),
+            before_message: relation,
+            near_author: Boolean(element.closest('[role="article"], article, [role="dialog"]')),
+            descendant_count: element.querySelectorAll('*').length,
+            text_length: option.text.length,
+          });
+        }
+      }
+      return { scanned_element_count: scanned, candidates };
+    }
+    """
+    try:
+        scan = article.evaluate(script)
+    except PlaywrightError:
+        return {"scanned_element_count": 0, "candidates": []}
+    if not isinstance(scan, dict):
+        return {"scanned_element_count": 0, "candidates": []}
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for raw_candidate in scan.get("candidates", []):
+        if not isinstance(raw_candidate, dict):
+            continue
+        visible_text = _normalize_visible_text(str(raw_candidate.get("visible_text") or ""))
+        publish_time, publish_time_text = _parse_facebook_publish_time(visible_text)
+        if not publish_time and not publish_time_text:
+            continue
+        candidate = {
+            **raw_candidate,
+            "visible_text": visible_text,
+            "matched_date_pattern": bool(publish_time),
+            "parsed_publish_time": publish_time,
+            "parsed_publish_time_text": publish_time_text,
+        }
+        existing = deduped.get(visible_text or "")
+        if existing is None or _date_candidate_sort_key(candidate) > _date_candidate_sort_key(existing):
+            deduped[visible_text or ""] = candidate
+
+    candidates = sorted(deduped.values(), key=_date_candidate_sort_key, reverse=True)
+    return {
+        "scanned_element_count": int(scan.get("scanned_element_count") or 0),
+        "candidates": candidates,
+    }
+
+
+def _date_candidate_sort_key(candidate: dict[str, Any]) -> tuple[int, int, int, int, int]:
+    return (
+        1 if candidate.get("parsed_publish_time") else 0,
+        1 if candidate.get("inside_anchor") else 0,
+        1 if candidate.get("before_message") else 0,
+        -int(candidate.get("descendant_count") or 0),
+        -int(candidate.get("text_length") or 0),
+    )
+
+
+def _publish_time_candidate_locators(article: Locator, post_id: str) -> Locator:
+    selector = ", ".join(
+        (
+            f'a[href*="story_fbid={post_id}"]',
+            f'a[href*="/posts/{post_id}"]',
+            f'a[href*="permalink.php"][href*="{post_id}"]',
+            'a[href*="story_fbid"]',
+            'a[href*="/posts/"]',
+            'a[href*="permalink.php"]',
+            'a[role="link"]',
+            '[role="link"]',
+            "[aria-label]",
+            "[title]",
+            "span",
+            "b",
+            "strong",
+            "time",
+        )
+    )
+    return article.locator(selector)
+
+
+def _parse_candidate_publish_time(candidate: Locator) -> tuple[str | None, str | None]:
+    aria_label = candidate.get_attribute("aria-label")
+    title = candidate.get_attribute("title")
+    visible_text = _get_visible_text(candidate)
+    return _parse_facebook_publish_time(visible_text, aria_label=aria_label, title=title)
+
+
+def _get_visible_text(locator: Locator) -> str | None:
+    try:
+        visible_text = locator.inner_text().strip()
+    except PlaywrightError:
+        visible_text = ""
+    visible_text = _normalize_visible_text(visible_text)
+    if visible_text and not _has_hidden_node_noise(visible_text):
+        return visible_text
+
+    script = """
+    (element) => {
+      const hiddenByStyle = (node) => {
+        let current = node.parentElement;
+        while (current) {
+          const style = window.getComputedStyle(current);
+          if (
+            current.getAttribute("aria-hidden") === "true" ||
+            style.display === "none" ||
+            style.visibility === "hidden" ||
+            style.opacity === "0"
+          ) {
+            return true;
+          }
+          current = current.parentElement;
+        }
+        return false;
+      };
+      const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+      const parts = [];
+      let node = walker.nextNode();
+      while (node) {
+        if (!hiddenByStyle(node)) {
+          parts.push(node.nodeValue || "");
+        }
+        node = walker.nextNode();
+      }
+      return parts.join("");
+    }
+    """
+    try:
+        fallback_text = locator.evaluate(script)
+    except PlaywrightError:
+        return visible_text or None
+    return _normalize_visible_text(str(fallback_text or ""))
+
+
+def _normalize_visible_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = re.sub(r"\s+", " ", value.replace("\xa0", " ")).strip()
+    return normalized or None
+
+
+def _has_hidden_node_noise(value: str) -> bool:
+    return bool(re.search(r"[A-Za-z]-[A-Za-z]|[A-Za-z]-\d|\d-\d", value))
+
+
+def _parse_facebook_publish_time(
+    visible_text: str | None,
+    aria_label: str | None = None,
+    title: str | None = None,
+) -> tuple[str | None, str | None]:
+    for raw_value in (aria_label, title, visible_text):
+        candidate = _normalize_visible_text(raw_value)
+        if not candidate:
+            continue
+
+        parsed_datetime = _parse_absolute_facebook_date(candidate)
+        if parsed_datetime is not None:
+            return parsed_datetime, _extract_publish_time_text(candidate)
+
+        if _is_relative_publish_time_text(candidate):
+            return None, candidate
 
     return None, None
 
 
-def _extract_metrics(article: Locator) -> tuple[int | None, int | None, int | None]:
-    text = _safe_inner_text(article) or ""
-    like_count = _parse_metric_near_words(text, ("reaction", "reactions", "like", "likes"))
-    comment_count = _parse_metric_near_words(text, ("comment", "comments"))
-    share_count = _parse_metric_near_words(text, ("share", "shares"))
-    return like_count, comment_count, share_count
-
-
-def _parse_metric_near_words(text: str, words: tuple[str, ...]) -> int | None:
-    for line in text.splitlines():
-        normalized = line.lower()
-        if any(word in normalized for word in words):
-            parsed = parse_metric_count(line)
-            if parsed is not None:
-                return parsed
+def _parse_absolute_facebook_date(value: str) -> str | None:
+    text = _extract_publish_time_text(value)
+    formats = (
+        ("%B %d, %Y at %I:%M %p", "datetime"),
+        ("%b %d, %Y at %I:%M %p", "datetime"),
+        ("%B %d, %Y", "date"),
+        ("%b %d, %Y", "date"),
+        ("%Y-%m-%d", "date"),
+    )
+    for date_format, output_kind in formats:
+        try:
+            parsed = datetime.strptime(text, date_format)
+        except ValueError:
+            continue
+        if output_kind == "datetime":
+            return parsed.isoformat(timespec="minutes")
+        return parsed.date().isoformat()
     return None
+
+
+def _extract_publish_time_text(value: str) -> str:
+    normalized = _normalize_visible_text(value) or ""
+    patterns = (
+        r"\b[A-Z][a-z]+ \d{1,2}, \d{4} at \d{1,2}:\d{2} [AP]M\b",
+        r"\b[A-Z][a-z]{2} \d{1,2}, \d{4} at \d{1,2}:\d{2} [AP]M\b",
+        r"\b[A-Z][a-z]+ \d{1,2}, \d{4}\b",
+        r"\b[A-Z][a-z]{2} \d{1,2}, \d{4}\b",
+        r"\b\d{4}-\d{2}-\d{2}\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            return match.group(0)
+    return normalized
+
+
+def _is_relative_publish_time_text(value: str) -> bool:
+    normalized = value.strip().lower()
+    return bool(
+        re.fullmatch(
+            r"\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)",
+            normalized,
+        )
+        or normalized in {"yesterday", "昨天"}
+    )
+
+
+def _extract_metrics(article: Locator) -> tuple[int | None, int | None, int | None]:
+    metrics = _extract_metric_details(article)
+    return metrics["like"].count, metrics["comment"].count, metrics["share"].count
+
+
+def _extract_action_count(container: Locator, rendering_role: str) -> int | None:
+    return _extract_action_count_details(container, rendering_role).count
+
+
+def _extract_action_count_details(container: Locator, rendering_role: str) -> ActionCountExtraction:
+    role_map = {
+        "like_button": "like",
+        "comment_button": "comment",
+        "share_button": "share",
+    }
+    metric_name = role_map.get(rendering_role)
+    if metric_name is None:
+        return ActionCountExtraction(
+            button_found=False,
+            raw_text=None,
+            count=None,
+            rejection_reason="unsupported_rendering_role",
+        )
+    return _extract_metric_details(container)[metric_name]
+
+
+def _extract_metric_details(container: Locator) -> dict[str, ActionCountExtraction]:
+    context = _action_bar_context(container)
+    candidates = _metric_summary_candidates(context)
+    metrics = {
+        "like": _metric_from_candidates(
+            "reaction",
+            button_found=bool(context["like_button_found"]),
+            candidates=candidates,
+        ),
+        "comment": _metric_from_candidates(
+            "comment",
+            button_found=bool(context["comment_button_found"]),
+            candidates=candidates,
+        ),
+        "share": _metric_from_candidates(
+            "share",
+            button_found=bool(context["share_button_found"]),
+            candidates=candidates,
+        ),
+    }
+    empty_state = _comment_empty_state(container)
+    if metrics["comment"].count is None and empty_state["found"]:
+        metrics["comment"] = ActionCountExtraction(
+            button_found=metrics["comment"].button_found,
+            raw_text=" | ".join(empty_state["markers"]),
+            count=0,
+            source="comment_empty_state",
+            rejection_reason=None,
+        )
+    return metrics
+
+
+def _action_bar_context(container: Locator) -> dict[str, Any]:
+    script = """
+    (container) => {
+      const roleNames = ['like_button', 'comment_button', 'share_button'];
+      const markers = Object.fromEntries(
+        roleNames.map((role) => [role, container.querySelector(`[data-ad-rendering-role="${role}"]`)])
+      );
+      const buttons = Object.fromEntries(
+        Object.entries(markers).map(([role, marker]) => [role, marker ? marker.closest('[role="button"]') : null])
+      );
+      const foundButtons = Object.values(buttons).filter(Boolean);
+      const commonAncestor = (nodes) => {
+        if (nodes.length === 0) {
+          return null;
+        }
+        let current = nodes[0];
+        while (current && !nodes.every((node) => current.contains(node))) {
+          current = current.parentElement;
+        }
+        return current;
+      };
+      const actionBar = commonAncestor(foundButtons);
+      const preview = (element) => element
+        ? (element.innerText || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 240)
+        : '';
+      const depthFromBar = (node) => {
+        if (!actionBar || !node) {
+          return null;
+        }
+        let depth = 0;
+        let current = node;
+        while (current && current !== actionBar) {
+          depth += 1;
+          current = current.parentElement;
+        }
+        return current === actionBar ? depth : null;
+      };
+      const candidateElements = [];
+      const addCandidate = (element, relativePosition) => {
+        if (!element || !container.contains(element)) {
+          return;
+        }
+        const text = preview(element);
+        if (!text) {
+          return;
+        }
+        candidateElements.push({ element, text, relative_position: relativePosition });
+      };
+      if (actionBar) {
+        let previous = actionBar.previousElementSibling;
+        for (let index = 0; previous && index < 3; index += 1) {
+          addCandidate(previous, `previous_sibling_${index + 1}`);
+          previous = previous.previousElementSibling;
+        }
+        let next = actionBar.nextElementSibling;
+        for (let index = 0; next && index < 3; index += 1) {
+          addCandidate(next, `next_sibling_${index + 1}`);
+          next = next.nextElementSibling;
+        }
+        let ancestor = actionBar.parentElement;
+        for (let depth = 1; ancestor && container.contains(ancestor) && depth <= 3; depth += 1) {
+          Array.from(ancestor.children).forEach((child, index) => {
+            if (child !== actionBar && !child.contains(actionBar)) {
+              addCandidate(child, `ancestor_${depth}_child_${index}`);
+            }
+          });
+          addCandidate(ancestor, `ancestor_${depth}`);
+          ancestor = ancestor.parentElement;
+        }
+      } else {
+        addCandidate(container, 'target_container_without_action_bar');
+      }
+      const uniqueCandidates = [];
+      const seen = new Set();
+      for (const candidate of candidateElements) {
+        const key = `${candidate.relative_position}:${candidate.text}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          uniqueCandidates.push({
+            text: candidate.text,
+            relative_position: candidate.relative_position,
+          });
+        }
+      }
+      return {
+        action_bar_found: Boolean(actionBar),
+        like_button_found: Boolean(buttons.like_button),
+        comment_button_found: Boolean(buttons.comment_button),
+        share_button_found: Boolean(buttons.share_button),
+        action_bar_ancestor_depth: Math.max(
+          ...Object.values(buttons).filter(Boolean).map(depthFromBar),
+          0
+        ),
+        action_bar_text_preview: preview(actionBar),
+        action_bar_match_strategy: actionBar ? 'rendering_role_common_ancestor' : null,
+        summary_candidates: uniqueCandidates.slice(0, 20),
+      };
+    }
+    """
+    defaults: dict[str, Any] = {
+        "action_bar_found": False,
+        "like_button_found": False,
+        "comment_button_found": False,
+        "share_button_found": False,
+        "action_bar_ancestor_depth": None,
+        "action_bar_text_preview": "",
+        "action_bar_match_strategy": None,
+        "summary_candidates": [],
+    }
+    try:
+        value = container.evaluate(script)
+    except PlaywrightError:
+        return defaults
+    if not isinstance(value, dict):
+        return defaults
+    return {**defaults, **value}
+
+
+def _metric_summary_candidates(context: dict[str, Any]) -> list[dict[str, Any]]:
+    diagnostics: list[dict[str, Any]] = []
+    for index, candidate in enumerate(context.get("summary_candidates") or []):
+        text = _normalize_visible_text(str(candidate.get("text") or ""))
+        if text is None:
+            continue
+        parsed = {
+            "index": index,
+            "text_preview": text[:240],
+            "relative_position": candidate.get("relative_position"),
+            "reaction_candidate": _parse_semantic_metric_text(text, "reaction"),
+            "comment_candidate": _parse_semantic_metric_text(text, "comment"),
+            "share_candidate": _parse_semantic_metric_text(text, "share"),
+            "reaction_candidate_source": None,
+            "comment_candidate_source": None,
+            "share_candidate_source": None,
+            "rejection_reason": None,
+        }
+        if parsed["reaction_candidate"] is not None:
+            parsed["reaction_candidate_source"] = "reaction_summary_text"
+        if parsed["comment_candidate"] is not None:
+            parsed["comment_candidate_source"] = "comment_summary_text"
+        if parsed["share_candidate"] is not None:
+            parsed["share_candidate_source"] = "share_summary_text"
+        ordered_counts = _parse_ordered_action_bar_counts(text, context)
+        if ordered_counts is not None:
+            parsed["reaction_candidate"] = ordered_counts[0]
+            parsed["comment_candidate"] = ordered_counts[1]
+            parsed["share_candidate"] = ordered_counts[2]
+            parsed["reaction_candidate_source"] = "action_bar_ordered_summary"
+            parsed["comment_candidate_source"] = "action_bar_ordered_summary"
+            parsed["share_candidate_source"] = "action_bar_ordered_summary"
+        if (
+            parsed["reaction_candidate"] is None
+            and parsed["comment_candidate"] is None
+            and parsed["share_candidate"] is None
+        ):
+            parsed["rejection_reason"] = "no_semantic_metric_text"
+        diagnostics.append(parsed)
+    return diagnostics
+
+
+def _metric_from_candidates(
+    metric_name: str,
+    button_found: bool,
+    candidates: list[dict[str, Any]],
+) -> ActionCountExtraction:
+    candidate_key = f"{metric_name}_candidate"
+    source_map = {
+        "reaction": "reaction_summary_text",
+        "comment": "comment_summary_text",
+        "share": "share_summary_text",
+    }
+    for candidate in candidates:
+        count = candidate.get(candidate_key)
+        if isinstance(count, int):
+            source = candidate.get(f"{metric_name}_candidate_source") or source_map[metric_name]
+            return ActionCountExtraction(
+                button_found=button_found,
+                raw_text=str(candidate.get("text_preview") or ""),
+                count=count,
+                source=str(source),
+                rejection_reason=None,
+            )
+    return ActionCountExtraction(
+        button_found=button_found,
+        raw_text=None,
+        count=None,
+        source=None,
+        rejection_reason="button_found_but_no_numeric_summary" if button_found else "button_not_found",
+    )
+
+
+def _parse_semantic_metric_text(value: str | None, metric_name: str) -> int | None:
+    text = _normalize_visible_text(value)
+    if text is None:
+        return None
+    word_groups = {
+        "reaction": ("reactions?", "likes?"),
+        "comment": ("comments?",),
+        "share": ("shares?",),
+    }
+    words = word_groups[metric_name]
+    number_pattern = r"(\d[\d,\s]*(?:\.\d+)?\s*(?:[KkMmBb万亿億])?)"
+    word_pattern = "|".join(words)
+    patterns = (
+        rf"{number_pattern}\s*(?:{word_pattern})\b",
+        rf"\b(?:{word_pattern})\s*[:：]?\s*{number_pattern}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        raw_number = match.group(1)
+        parsed = parse_metric_count(raw_number)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _parse_ordered_action_bar_counts(value: str | None, context: dict[str, Any]) -> tuple[int, int, int] | None:
+    if not (
+        context.get("action_bar_found")
+        and context.get("like_button_found")
+        and context.get("comment_button_found")
+        and context.get("share_button_found")
+    ):
+        return None
+    text = _normalize_visible_text(value)
+    if text is None:
+        return None
+    if re.search(r"\b(reactions?|likes?|comments?|shares?)\b", text, flags=re.IGNORECASE):
+        return None
+    number_matches = re.findall(r"\d[\d,]*(?:\.\d+)?\s*(?:[KkMmBb万亿億])?", text)
+    numbers = [parse_metric_count(match) for match in number_matches]
+    parsed_numbers = [number for number in numbers if number is not None]
+    if len(parsed_numbers) != 3:
+        return None
+    if len(" ".join(text.split())) > 40:
+        return None
+    return parsed_numbers[0], parsed_numbers[1], parsed_numbers[2]
+
+
+def _parse_action_count_text(value: str | None) -> int | None:
+    text = _normalize_visible_text(value)
+    if text is None:
+        return None
+    if not re.fullmatch(r"\d[\d,\s]*(?:\.\d+)?\s*(?:[KkMmBb万亿億])?", text):
+        return None
+    return parse_metric_count(text)
+
+
+def _comment_empty_state(container: Locator | None) -> dict[str, Any]:
+    if container is None:
+        return {"found": False, "markers": []}
+    try:
+        text = container.inner_text(timeout=1_000)
+    except PlaywrightError:
+        return {"found": False, "markers": []}
+    normalized = " ".join(text.split()).lower()
+    marker_pairs = (
+        ("No comments yet", "Be the first to comment."),
+        ("No comments yet", "Be the first to comment"),
+    )
+    for first, second in marker_pairs:
+        if first.lower() in normalized and second.lower().rstrip(".") in normalized:
+            return {"found": True, "markers": [first, second]}
+    return {"found": False, "markers": []}
 
 
 def _page_metadata(page: Page) -> dict[str, str]:
@@ -559,14 +1959,46 @@ def _collect_failure_diagnostics(
     post_id: str,
     input_url: str | None,
     field_locator_presence: dict[str, bool] | None = None,
+    target_container: Locator | None = None,
+    selected_container_index: int | None = None,
+    selected_container_metrics: dict[str, int | bool] | None = None,
+    selected_container_strategy: str | None = None,
+    selected_message_index: int | None = None,
+    selected_ancestor_depth: int | None = None,
+    selected_container_score: int | None = None,
+    selected_container_reasons: list[str] | None = None,
+    selected_publish_time: str | None = None,
+    selected_publish_time_text: str | None = None,
 ) -> dict[str, Any]:
     DEBUG_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     matched_container_count = _matched_semantic_container_count(page, post_id)
+    publish_time_scan = _publish_time_candidate_diagnostics(target_container)
+    action_count_diagnostics = _action_count_diagnostics(target_container)
+    if selected_publish_time is None and selected_publish_time_text is None:
+        selected_candidate = _select_best_publish_time_candidate(publish_time_scan["candidates"])
+        if selected_candidate is not None:
+            selected_publish_time = _optional_string(selected_candidate.get("parsed_publish_time"))
+            selected_publish_time_text = _optional_string(selected_candidate.get("parsed_publish_time_text"))
+    selected_container_diagnostics = _selected_container_diagnostics(
+        target_container,
+        post_id,
+        selected_container_index=selected_container_index,
+        selected_container_metrics=selected_container_metrics,
+    )
+    if selected_ancestor_depth is not None:
+        selected_container_diagnostics["selected_container_depth"] = selected_ancestor_depth
+    publish_time_strict_match_found = len(publish_time_scan["candidates"]) > 0
+    publish_time_selected = selected_publish_time is not None or selected_publish_time_text is not None
+    title_context = _post_title_context(_safe_page_title(page))
+    article_candidates = _article_candidate_diagnostics(page, post_id, title_context)
+    message_candidates = _message_candidate_diagnostics(page, title_context)
+    ancestor_candidates = _message_ancestor_candidate_diagnostics(page, title_context)
     diagnostics: dict[str, Any] = {
         "input_url": input_url,
         "final_url": _safe_page_url(page),
         "page_title": _safe_page_title(page),
         "target_post_id": post_id,
+        "title_match_context": title_context,
         "article_count": _safe_count(page.locator("article")),
         "role_article_count": _safe_count(page.locator(ROLE_ARTICLE_SELECTOR)),
         "dialog_count": _safe_count(page.locator('[role="dialog"]')),
@@ -576,14 +2008,37 @@ def _collect_failure_diagnostics(
         "posts_path_link_count": _safe_count(page.locator(f'a[href*="/posts/{post_id}"]')),
         "matched_article_count": _safe_count(page.locator(ROLE_ARTICLE_SELECTOR).filter(has=_target_post_link_locator(page, post_id))),
         "matched_container_count": matched_container_count,
+        "container_candidate_count": _container_candidate_count(page, post_id),
+        "article_candidates": article_candidates,
+        "message_candidates": message_candidates,
+        "message_ancestor_candidates": ancestor_candidates,
+        **selected_container_diagnostics,
+        "selected_message_index": selected_message_index,
+        "selected_ancestor_depth": selected_ancestor_depth,
+        "selected_container_score": selected_container_score,
+        "selected_container_reasons": selected_container_reasons or [],
+        "container_rejection_reason": None
+        if target_container is not None
+        else _message_ancestor_rejection_reason(message_candidates, ancestor_candidates),
         "message_locator_count": _safe_count(page.locator(", ".join(MESSAGE_SELECTORS))),
         "time_candidate_count": _safe_count(page.locator("time, a[aria-label]")),
         "time_locator_count": _safe_count(page.locator("time, a[aria-label]")),
+        "publish_time_locator_present": _safe_count(page.locator("time, a[aria-label], [aria-labelledby], [title]")) > 0,
+        "publish_time_strict_match_found": publish_time_strict_match_found,
+        "publish_time_selected": publish_time_selected,
+        "publish_time_scanned_element_count": publish_time_scan["scanned_element_count"],
+        "publish_time_strict_match_count": len(publish_time_scan["candidates"]),
+        "publish_time_candidate_count": len(publish_time_scan["candidates"]),
+        "publish_time_candidates": publish_time_scan["candidates"][:10],
+        "selected_publish_time_text": selected_publish_time_text,
+        "selected_publish_time": selected_publish_time,
         "author_candidate_count": _safe_count(page.locator('a[role="link"], a[href]')),
         "reaction_candidate_count": _safe_count(page.locator(_metric_candidate_selector(("reaction", "like")))),
         "comment_candidate_count": _safe_count(page.locator(_metric_candidate_selector(("comment",)))),
         "share_candidate_count": _safe_count(page.locator(_metric_candidate_selector(("share",)))),
-        "container_match_strategy": _container_match_strategy(page, post_id, matched_container_count),
+        **action_count_diagnostics,
+        "container_match_strategy": selected_container_strategy
+        or _container_match_strategy(page, post_id, matched_container_count),
         "login_wall_detected": _login_wall_detected(page),
         "unavailable_message_detected": _unavailable_message_detected(page),
         "metadata_available": _metadata_has_post_specific_content(_page_metadata(page)),
@@ -617,6 +2072,93 @@ def _collect_failure_diagnostics(
         diagnostics["diagnostics_json_error"] = str(exc)
 
     return diagnostics
+
+
+def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any]:
+    empty = {
+        "action_bar_found": False,
+        "action_bar_ancestor_depth": None,
+        "action_bar_text_preview": "",
+        "action_bar_match_strategy": None,
+        "like_button_found": False,
+        "like_count_raw": None,
+        "like_count": None,
+        "like_count_source": None,
+        "like_count_rejection_reason": "button_not_found",
+        "comment_button_found": False,
+        "comment_count_raw": None,
+        "comment_count": None,
+        "comment_count_source": None,
+        "comment_count_rejection_reason": "button_not_found",
+        "share_button_found": False,
+        "share_count_raw": None,
+        "share_count": None,
+        "share_count_source": None,
+        "share_count_rejection_reason": "button_not_found",
+        "metric_summary_candidates": [],
+        "comment_empty_state_found": False,
+        "comment_empty_state_markers": [],
+    }
+    if target_container is None:
+        return empty
+
+    context = _action_bar_context(target_container)
+    summary_candidates = _metric_summary_candidates(context)
+    metrics = _extract_metric_details(target_container)
+    like = metrics["like"]
+    comment = metrics["comment"]
+    share = metrics["share"]
+    empty_state = _comment_empty_state(target_container)
+    return {
+        "action_bar_found": bool(context["action_bar_found"]),
+        "action_bar_ancestor_depth": context["action_bar_ancestor_depth"],
+        "action_bar_text_preview": context["action_bar_text_preview"],
+        "action_bar_match_strategy": context["action_bar_match_strategy"],
+        "like_button_found": like.button_found,
+        "like_count_raw": like.raw_text,
+        "like_count": like.count,
+        "like_count_source": like.source,
+        "like_count_rejection_reason": like.rejection_reason,
+        "comment_button_found": comment.button_found,
+        "comment_count_raw": comment.raw_text,
+        "comment_count": comment.count,
+        "comment_count_source": comment.source,
+        "comment_count_rejection_reason": comment.rejection_reason,
+        "share_button_found": share.button_found,
+        "share_count_raw": share.raw_text,
+        "share_count": share.count,
+        "share_count_source": share.source,
+        "share_count_rejection_reason": share.rejection_reason,
+        "metric_summary_candidates": summary_candidates,
+        "comment_empty_state_found": bool(empty_state["found"]),
+        "comment_empty_state_markers": list(empty_state["markers"]),
+    }
+
+
+def _article_candidate_diagnostics(
+    page: Page,
+    post_id: str,
+    title_context: dict[str, str | None],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    articles = page.locator(ROLE_ARTICLE_SELECTOR)
+    summaries: list[dict[str, Any]] = []
+    for index in range(min(max(_safe_count(articles), 0), limit)):
+        summaries.append(_article_diagnostic_summary(articles.nth(index), index, post_id, title_context))
+    return summaries
+
+
+def _publish_time_candidate_diagnostics(
+    target_container: Locator | None,
+    limit: int = 10,
+) -> dict[str, Any]:
+    if target_container is None:
+        return {"scanned_element_count": 0, "candidates": []}
+    scan = _visible_publish_time_candidates(target_container)
+    return {
+        "scanned_element_count": scan["scanned_element_count"],
+        "candidates": scan["candidates"][:limit],
+    }
 
 
 def _diagnostics_summary(diagnostics: dict[str, Any]) -> str:
@@ -679,9 +2221,43 @@ def _matched_semantic_container_count(page: Page, post_id: str) -> int:
     return total
 
 
+def _container_candidate_count(page: Page, post_id: str) -> int:
+    total = 0
+    target_links = _target_post_link_locator(page, post_id)
+    for selector in TARGET_CONTAINER_SELECTORS:
+        total += max(_safe_count(page.locator(selector).filter(has=target_links)), 0)
+    return total
+
+
+def _selected_container_diagnostics(
+    target_container: Locator | None,
+    post_id: str,
+    selected_container_index: int | None = None,
+    selected_container_metrics: dict[str, int | bool] | None = None,
+) -> dict[str, int | None]:
+    if target_container is None:
+        return {
+            "selected_container_index": None,
+            "selected_container_depth": None,
+            "selected_container_message_count": None,
+            "selected_container_author_count": None,
+            "selected_container_text_length": None,
+            "selected_container_descendant_count": None,
+        }
+    metrics = selected_container_metrics or _container_metrics(target_container, post_id)
+    return {
+        "selected_container_index": selected_container_index,
+        "selected_container_depth": int(metrics["depth"]),
+        "selected_container_message_count": int(metrics["messageCount"]),
+        "selected_container_author_count": int(metrics["authorCount"]),
+        "selected_container_text_length": int(metrics["textLength"]),
+        "selected_container_descendant_count": int(metrics["descendantCount"]),
+    }
+
+
 def _container_match_strategy(page: Page, post_id: str, matched_container_count: int) -> str | None:
     if matched_container_count > 0:
-        return "target_id_semantic_container"
+        return "smallest_semantic_target_container"
     if _is_single_post_permalink(page, post_id) and _single_semantic_post_container(page) is not None:
         return "single_semantic_post_container"
     if _safe_count(_target_post_link_locator(page, post_id)) > 0:

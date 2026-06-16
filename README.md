@@ -142,3 +142,31 @@ Facebook：
 - Scheduler
 - 并发
 - 验证码绕过、代理池或反检测功能
+## Facebook batch extraction
+
+Batch mode reuses one authenticated Playwright browser context and processes Facebook post URLs sequentially.
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --facebook-batch-file "output/facebook_batch_sample_urls.json" `
+  --facebook-storage-state ".playwright/facebook_storage_state.json" `
+  --facebook-batch-output "output/facebook_posts.jsonl" `
+  --facebook-batch-delay 2
+```
+
+Optional flags:
+- `--facebook-batch-limit 3`
+- `--facebook-batch-resume`
+- `--headless`
+
+Supported input JSON formats:
+- A list of URL strings.
+- A list of objects with `url`, `canonical_url`, or `original_url`.
+- An object containing a `posts` or `urls` list.
+
+Outputs:
+- `output/facebook_posts.jsonl`: one result per processed input item.
+- `output/facebook_batch_summary.json`: batch summary and counts.
+- `output/debug/facebook_batch/`: per-item diagnostics, HTML, and screenshots.
+
+Batch mode does not collect comments, does not expand Facebook URL support, does not perform automatic login, and does not overwrite `output/facebook_post.json`.

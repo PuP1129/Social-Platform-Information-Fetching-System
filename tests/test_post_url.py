@@ -85,6 +85,16 @@ class ClassifyFacebookPostUrlTests(unittest.TestCase):
                 "1234567890",
                 "https://www.facebook.com/story.php?story_fbid=1234567890&id=987654321",
             ),
+            (
+                "https://www.facebook.com/groups/booklovers/posts/1234567890/",
+                "1234567890",
+                "https://www.facebook.com/groups/booklovers/posts/1234567890",
+            ),
+            (
+                "https://www.facebook.com/groups/booklovers/posts/pfbidExample123?rdid=abc#comments",
+                "pfbidExample123",
+                "https://www.facebook.com/groups/booklovers/posts/pfbidExample123",
+            ),
         ]
 
         for url, post_id, canonical_url in cases:
@@ -95,11 +105,20 @@ class ClassifyFacebookPostUrlTests(unittest.TestCase):
                 self.assertEqual(result["post_id"], post_id)
                 self.assertEqual(result["canonical_url"], canonical_url)
 
+    def test_facebook_group_post_has_group_context(self) -> None:
+        result = classify_post_url("https://www.facebook.com/groups/booklovers/posts/1234567890/")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["context_type"], "group")
+
     def test_invalid_facebook_urls(self) -> None:
         urls = [
             "https://www.facebook.com/openai",
             "https://www.facebook.com/search/top?q=openai",
-            "https://www.facebook.com/groups/example/posts/123",
+            "https://www.facebook.com/groups/example/",
+            "https://www.facebook.com/groups/example/media/",
+            "https://www.facebook.com/groups/example/members/",
+            "https://www.facebook.com/groups/example/search/",
             "https://www.facebook.com/reel/123",
             "https://www.facebook.com/openai/videos/123",
             "https://www.facebook.com/share/p/example",

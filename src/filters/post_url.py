@@ -53,17 +53,18 @@ def filter_post_results(results: list[dict]) -> list[dict]:
             continue
 
         seen_posts.add(dedupe_key)
-        filtered_results.append(
-            {
-                "rank": result.get("rank"),
-                "platform": classified["platform"],
-                "post_id": classified["post_id"],
-                "original_url": url,
-                "canonical_url": classified["canonical_url"],
-                "title": result.get("title"),
-                "snippet": result.get("snippet"),
-            }
-        )
+        filtered_result = {
+            "rank": result.get("rank"),
+            "platform": classified["platform"],
+            "post_id": classified["post_id"],
+            "original_url": url,
+            "canonical_url": classified["canonical_url"],
+            "title": result.get("title"),
+            "snippet": result.get("snippet"),
+        }
+        if "context_type" in classified:
+            filtered_result["context_type"] = classified["context_type"]
+        filtered_results.append(filtered_result)
 
     return filtered_results
 
@@ -119,6 +120,21 @@ def _classify_x_url(path: str) -> dict[str, str] | None:
 def _classify_facebook_url(path: str, query: str) -> dict[str, str] | None:
     segments = _path_segments(path)
 
+    if len(segments) >= 4 and segments[0] == "groups" and segments[2] == "posts":
+        group = segments[1]
+        post_id = segments[3]
+        if not group or not _is_valid_facebook_path_post_id(post_id):
+            return None
+        return {
+            "platform": "facebook",
+            "post_id": post_id,
+            "canonical_url": (
+                "https://www.facebook.com/groups/"
+                f"{_quote_path_part(group)}/posts/{_quote_path_part(post_id)}"
+            ),
+            "context_type": "group",
+        }
+
     if len(segments) >= 3 and segments[1] == "posts":
         account = segments[0]
         post_id = segments[2]
@@ -131,6 +147,7 @@ def _classify_facebook_url(path: str, query: str) -> dict[str, str] | None:
                 "https://www.facebook.com/"
                 f"{_quote_path_part(account)}/posts/{_quote_path_part(post_id)}"
             ),
+            "context_type": "profile",
         }
 
     page_name = segments[0] if len(segments) == 1 else ""
