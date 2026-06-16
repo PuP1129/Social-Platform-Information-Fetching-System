@@ -1918,7 +1918,7 @@ def _extract_metric_details(container: Locator) -> dict[str, ActionCountExtracti
 
 
 def _action_bar_context(container: Locator) -> dict[str, Any]:
-    script = """
+    script = r"""
     (container) => {
       const roleNames = ['like_button', 'comment_button', 'share_button'];
       const markers = Object.fromEntries(
@@ -1965,7 +1965,37 @@ def _action_bar_context(container: Locator) -> dict[str, Any]:
         }
         candidateElements.push({ element, text, relative_position: relativePosition });
       };
+      const addTextCandidate = (text, relativePosition) => {
+        const normalized = (text || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim();
+        if (!normalized) {
+          return;
+        }
+        candidateElements.push({ element: null, text: normalized.slice(0, 240), relative_position: relativePosition });
+      };
+      const ariaLabel = (element) => element ? (element.getAttribute('aria-label') || '').trim() : '';
+      const allRoleButtons = Array.from(container.querySelectorAll('[role="button"]'));
+      const actionButtonAriaLabels = allRoleButtons
+        .map(ariaLabel)
+        .filter(Boolean)
+        .slice(0, 20);
+      const collectNearbyNumericTexts = (root) => {
+        if (!root) {
+          return [];
+        }
+        return Array.from(root.querySelectorAll('span[dir="auto"], div[dir="auto"], [aria-label]'))
+          .map((node) => {
+            const text = preview(node);
+            const label = ariaLabel(node);
+            return text || label;
+          })
+          .filter((text) => /\d/.test(text))
+          .slice(0, 20);
+      };
       if (actionBar) {
+        addCandidate(actionBar, 'action_bar');
+        Object.entries(buttons).forEach(([role, button]) => {
+          addTextCandidate(ariaLabel(button), `${role}_button_aria_label`);
+        });
         let previous = actionBar.previousElementSibling;
         for (let index = 0; previous && index < 3; index += 1) {
           addCandidate(previous, `previous_sibling_${index + 1}`);
@@ -2006,12 +2036,24 @@ def _action_bar_context(container: Locator) -> dict[str, Any]:
         like_button_found: Boolean(buttons.like_button),
         comment_button_found: Boolean(buttons.comment_button),
         share_button_found: Boolean(buttons.share_button),
+        action_role_count: allRoleButtons.length,
+        like_button_count: container.querySelectorAll('[data-ad-rendering-role="like_button"]').length,
+        comment_button_count: container.querySelectorAll('[data-ad-rendering-role="comment_button"]').length,
+        share_button_count: container.querySelectorAll('[data-ad-rendering-role="share_button"]').length,
         action_bar_ancestor_depth: Math.max(
           ...Object.values(buttons).filter(Boolean).map(depthFromBar),
           0
         ),
         action_bar_text_preview: preview(actionBar),
         action_bar_match_strategy: actionBar ? 'rendering_role_common_ancestor' : null,
+        action_button_aria_labels: actionButtonAriaLabels,
+        candidate_action_bar_count: uniqueCandidates.length,
+        candidate_action_bar_texts: uniqueCandidates.map((candidate) => candidate.text).slice(0, 10),
+        nearby_numeric_texts: collectNearbyNumericTexts(actionBar),
+        reaction_summary_texts: Array.from(container.querySelectorAll('[aria-label*="reaction" i], [aria-label*="reacted" i], [aria-label*="Like:" i]'))
+          .map((node) => ariaLabel(node) || preview(node))
+          .filter(Boolean)
+          .slice(0, 10),
         summary_candidates: uniqueCandidates.slice(0, 20),
       };
     }
@@ -2021,9 +2063,18 @@ def _action_bar_context(container: Locator) -> dict[str, Any]:
         "like_button_found": False,
         "comment_button_found": False,
         "share_button_found": False,
+        "action_role_count": 0,
+        "like_button_count": 0,
+        "comment_button_count": 0,
+        "share_button_count": 0,
         "action_bar_ancestor_depth": None,
         "action_bar_text_preview": "",
         "action_bar_match_strategy": None,
+        "action_button_aria_labels": [],
+        "candidate_action_bar_count": 0,
+        "candidate_action_bar_texts": [],
+        "nearby_numeric_texts": [],
+        "reaction_summary_texts": [],
         "summary_candidates": [],
     }
     try:
@@ -2059,14 +2110,15 @@ def _metric_summary_candidates(context: dict[str, Any]) -> list[dict[str, Any]]:
             parsed["comment_candidate_source"] = "comment_summary_text"
         if parsed["share_candidate"] is not None:
             parsed["share_candidate_source"] = "share_summary_text"
-        ordered_counts = _parse_ordered_action_bar_counts(text, context)
+        ordered_counts = _parse_ordered_action_bar_counts(text, context, parsed["relative_position"])
         if ordered_counts is not None:
             parsed["reaction_candidate"] = ordered_counts[0]
             parsed["comment_candidate"] = ordered_counts[1]
             parsed["share_candidate"] = ordered_counts[2]
-            parsed["reaction_candidate_source"] = "action_bar_ordered_summary"
-            parsed["comment_candidate_source"] = "action_bar_ordered_summary"
-            parsed["share_candidate_source"] = "action_bar_ordered_summary"
+            source = "action_bar_ordered_summary" if ordered_counts[2] is not None else "action_bar_ordered_partial_summary"
+            parsed["reaction_candidate_source"] = source
+            parsed["comment_candidate_source"] = source
+            parsed["share_candidate_source"] = source if ordered_counts[2] is not None else None
         if (
             parsed["reaction_candidate"] is None
             and parsed["comment_candidate"] is None
@@ -2135,13 +2187,19 @@ def _parse_semantic_metric_text(value: str | None, metric_name: str) -> int | No
     return None
 
 
-def _parse_ordered_action_bar_counts(value: str | None, context: dict[str, Any]) -> tuple[int, int, int] | None:
+def _parse_ordered_action_bar_counts(
+    value: str | None,
+    context: dict[str, Any],
+    relative_position: Any = None,
+) -> tuple[int | None, int | None, int | None] | None:
     if not (
         context.get("action_bar_found")
         and context.get("like_button_found")
         and context.get("comment_button_found")
         and context.get("share_button_found")
     ):
+        return None
+    if relative_position != "action_bar":
         return None
     text = _normalize_visible_text(value)
     if text is None:
@@ -2151,11 +2209,13 @@ def _parse_ordered_action_bar_counts(value: str | None, context: dict[str, Any])
     number_matches = re.findall(r"\d[\d,]*(?:\.\d+)?\s*(?:[KkMmBb万亿億])?", text)
     numbers = [parse_metric_count(match) for match in number_matches]
     parsed_numbers = [number for number in numbers if number is not None]
-    if len(parsed_numbers) != 3:
-        return None
     if len(" ".join(text.split())) > 40:
         return None
-    return parsed_numbers[0], parsed_numbers[1], parsed_numbers[2]
+    if len(parsed_numbers) == 3:
+        return parsed_numbers[0], parsed_numbers[1], parsed_numbers[2]
+    if len(parsed_numbers) == 2:
+        return parsed_numbers[0], parsed_numbers[1], None
+    return None
 
 
 def _parse_action_count_text(value: str | None) -> int | None:
@@ -2370,9 +2430,19 @@ def _collect_failure_diagnostics(
 def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any]:
     empty = {
         "action_bar_found": False,
+        "action_role_count": 0,
+        "like_button_count": 0,
+        "comment_button_count": 0,
+        "share_button_count": 0,
         "action_bar_ancestor_depth": None,
         "action_bar_text_preview": "",
         "action_bar_match_strategy": None,
+        "action_button_aria_labels": [],
+        "candidate_action_bar_count": 0,
+        "candidate_action_bar_texts": [],
+        "nearby_numeric_texts": [],
+        "reaction_summary_count": 0,
+        "reaction_summary_texts": [],
         "like_button_found": False,
         "like_count_raw": None,
         "like_count": None,
@@ -2404,9 +2474,19 @@ def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any
     empty_state = _comment_empty_state(target_container)
     return {
         "action_bar_found": bool(context["action_bar_found"]),
+        "action_role_count": context["action_role_count"],
+        "like_button_count": context["like_button_count"],
+        "comment_button_count": context["comment_button_count"],
+        "share_button_count": context["share_button_count"],
         "action_bar_ancestor_depth": context["action_bar_ancestor_depth"],
         "action_bar_text_preview": context["action_bar_text_preview"],
         "action_bar_match_strategy": context["action_bar_match_strategy"],
+        "action_button_aria_labels": context["action_button_aria_labels"],
+        "candidate_action_bar_count": context["candidate_action_bar_count"],
+        "candidate_action_bar_texts": context["candidate_action_bar_texts"],
+        "nearby_numeric_texts": context["nearby_numeric_texts"],
+        "reaction_summary_count": len(context["reaction_summary_texts"]),
+        "reaction_summary_texts": context["reaction_summary_texts"],
         "like_button_found": like.button_found,
         "like_count_raw": like.raw_text,
         "like_count": like.count,

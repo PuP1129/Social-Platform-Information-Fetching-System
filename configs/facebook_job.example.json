@@ -1,0 +1,9 @@
+{
+  "keywords_file": "examples/facebook_keywords.example.json",
+  "storage_state": ".playwright/facebook_storage_state.json",
+  "batch_input": "examples/facebook_batch_urls.example.json",
+  "batch_output": "output/facebook_posts.jsonl",
+  "batch_limit": 5,
+  "batch_delay_seconds": 2,
+  "save_debug_bundle": false
+}

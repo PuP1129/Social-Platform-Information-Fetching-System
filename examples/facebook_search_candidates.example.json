@@ -1,0 +1,81 @@
+{
+  "topic": "Genshin Impact",
+  "query_count": 9,
+  "candidate_count": 9,
+  "post_count": 2,
+  "posts": [
+    {
+      "post_id": "1449348982581954",
+      "original_url": "https://www.facebook.com/story.php?story_fbid=1449348982581954&id=326121328238064",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=1449348982581954&id=326121328238064",
+      "final_url": "https://www.facebook.com/story.php?story_fbid=1449348982581954&id=326121328238064",
+      "final_destination_type": "story_or_permalink",
+      "title": "Genshin Impact - Facebook",
+      "snippet": "Your Genius Invokation TCG dueling journey just got a whole lot easier! Dear Travelers, New Version 3.7 Genshin Impact tool upgrades have been added to...",
+      "source_query": "site:facebook.com \"Genshin Impact\" \"story_fbid\"",
+      "preflight_status": "accepted"
+    },
+    {
+      "post_id": "1035071751957724",
+      "original_url": "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+      "final_url": "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+      "final_destination_type": "story_or_permalink",
+      "title": "The McDonald's and Genshin Impact video game collaboration has ...",
+      "snippet": "... Grab the Genshin Impact Apple Pie or the Genshin Impact Deluxe McCrispy Meal to unlock exclusive in-game items. Have fun! Log in · 󰟙. McDonald's post.",
+      "source_query": "site:facebook.com \"Genshin Impact\" \"story_fbid\"",
+      "preflight_status": "accepted"
+    }
+  ],
+  "rejected": [
+    {
+      "post_id": "448643073527356",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=448643073527356&id=100044256047942",
+      "final_url": "https://www.facebook.com/watch/?v=448643073527356",
+      "final_destination_type": "watch",
+      "reason": "Unsupported Facebook Watch/video destination"
+    },
+    {
+      "post_id": "1507332216850359",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=1507332216850359&id=100063521201875",
+      "final_url": "https://www.facebook.com/watch/?v=1507332216850359",
+      "final_destination_type": "watch",
+      "reason": "Unsupported Facebook Watch/video destination"
+    },
+    {
+      "post_id": "772330844578274",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=772330844578274&id=100044527445610",
+      "final_url": "https://www.facebook.com/reel/772330844578274/",
+      "final_destination_type": "reel",
+      "reason": "Unsupported Facebook Reel destination"
+    },
+    {
+      "post_id": "867427231773028",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=867427231773028&id=100086094564187",
+      "final_url": "https://www.facebook.com/reel/867427231773028",
+      "final_destination_type": "reel",
+      "reason": "Unsupported Facebook Reel destination"
+    },
+    {
+      "post_id": "350275320560488",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=350275320560488&id=213453978681111",
+      "final_url": "https://www.facebook.com/watch/?v=350275320560488",
+      "final_destination_type": "watch",
+      "reason": "Unsupported Facebook Watch/video destination"
+    },
+    {
+      "post_id": "458013013055693",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=458013013055693&id=326121328238064",
+      "final_url": "https://www.facebook.com/Genshinimpact/videos/458013013055693/",
+      "final_destination_type": "unknown",
+      "reason": "Preflight failed: Page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to \"https://www.facebook.com/story.php?story_fbid=458013013055693&id=326121328238064\", waiting until \"domcontentloaded\"\n"
+    },
+    {
+      "post_id": "456055062551201",
+      "canonical_url": "https://www.facebook.com/story.php?story_fbid=456055062551201&id=100044401330548",
+      "final_url": "https://www.facebook.com/watch/?v=311725254147808",
+      "final_destination_type": "watch",
+      "reason": "Unsupported Facebook Watch/video destination"
+    }
+  ]
+}

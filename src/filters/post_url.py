@@ -120,7 +120,7 @@ def _classify_x_url(path: str) -> dict[str, str] | None:
 def _classify_facebook_url(path: str, query: str) -> dict[str, str] | None:
     segments = _path_segments(path)
 
-    if len(segments) >= 4 and segments[0] == "groups" and segments[2] == "posts":
+    if len(segments) >= 4 and segments[0] == "groups" and segments[2] in {"posts", "permalink"}:
         group = segments[1]
         post_id = segments[3]
         if not group or not _is_valid_facebook_path_post_id(post_id):

@@ -95,6 +95,11 @@ class ClassifyFacebookPostUrlTests(unittest.TestCase):
                 "pfbidExample123",
                 "https://www.facebook.com/groups/booklovers/posts/pfbidExample123",
             ),
+            (
+                "https://www.facebook.com/groups/booklovers/permalink/1234567890/?comment_id=999#comments",
+                "1234567890",
+                "https://www.facebook.com/groups/booklovers/posts/1234567890",
+            ),
         ]
 
         for url, post_id, canonical_url in cases:
@@ -183,6 +188,28 @@ class FilterPostResultsTests(unittest.TestCase):
         self.assertEqual(filtered[1]["rank"], 4)
         self.assertEqual(filtered[1]["platform"], "facebook")
         self.assertEqual(filtered[1]["post_id"], "123")
+
+    def test_group_posts_and_permalink_urls_dedupe_to_same_post(self) -> None:
+        filtered = filter_post_results(
+            [
+                {
+                    "rank": 1,
+                    "title": "Group posts path",
+                    "url": "https://www.facebook.com/groups/booklovers/posts/1234567890",
+                    "snippet": "first",
+                },
+                {
+                    "rank": 2,
+                    "title": "Group permalink path",
+                    "url": "https://www.facebook.com/groups/booklovers/permalink/1234567890/?comment_id=999",
+                    "snippet": "duplicate",
+                },
+            ]
+        )
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["rank"], 1)
+        self.assertEqual(filtered[0]["canonical_url"], "https://www.facebook.com/groups/booklovers/posts/1234567890")
 
     def test_skips_wrong_url_types_without_failing(self) -> None:
         filtered = filter_post_results(

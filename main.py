@@ -20,8 +20,29 @@ def parse_args() -> argparse.Namespace:
     input_group.add_argument("--x-url", help="Single X post URL to extract.")
     input_group.add_argument("--facebook-url", help="Single public Facebook post URL to extract.")
     input_group.add_argument("--facebook-batch-file", type=Path, help="JSON file containing Facebook post URLs to extract.")
+    input_group.add_argument(
+        "--facebook-search-keyword",
+        action="append",
+        help="Search Google PSE and batch-extract Facebook posts. May be repeated.",
+    )
+    input_group.add_argument(
+        "--facebook-search-keywords-file",
+        type=Path,
+        help="JSON file containing Facebook search keywords.",
+    )
+    input_group.add_argument(
+        "--facebook-search-manifest",
+        type=Path,
+        help="Run Facebook batch from a saved Facebook search manifest without Google PSE.",
+    )
     parser.add_argument("--headless", action="store_true", help="Run Chromium in headless mode.")
     parser.add_argument("--max-results", type=int, default=10, help="Maximum number of merged Google PSE results to save.")
+    parser.add_argument(
+        "--facebook-search-max-results",
+        type=int,
+        default=10,
+        help="Maximum number of Google PSE results to inspect for Facebook search collection.",
+    )
     parser.add_argument(
         "--facebook-batch-output",
         type=Path,
@@ -114,11 +135,24 @@ def main() -> None:
             args.facebook_storage_state,
             args.facebook_save_debug_bundle,
         )
-    else:
+    elif args.facebook_batch_file:
         run_facebook_batch_extraction(
             input_path=args.facebook_batch_file,
             output_path=args.facebook_batch_output,
             limit=args.facebook_batch_limit,
+            delay_seconds=args.facebook_batch_delay,
+            resume=args.facebook_batch_resume,
+            headless=args.headless,
+            storage_state_path=args.facebook_storage_state,
+            save_debug_bundle=args.facebook_save_debug_bundle,
+        )
+    else:
+        run_facebook_search_collection(
+            keywords=args.facebook_search_keyword,
+            keywords_file=args.facebook_search_keywords_file,
+            manifest_path=args.facebook_search_manifest,
+            max_results=args.facebook_search_max_results,
+            output_path=args.facebook_batch_output,
             delay_seconds=args.facebook_batch_delay,
             resume=args.facebook_batch_resume,
             headless=args.headless,
@@ -269,6 +303,91 @@ def run_facebook_batch_extraction(
     )
     print(f"JSONL written to {output_path}")
     print(f"Summary written to {DEFAULT_BATCH_SUMMARY_PATH}")
+
+
+def run_facebook_search_collection(
+    keywords: list[str] | None,
+    keywords_file: Path | None,
+    manifest_path: Path | None,
+    max_results: int,
+    output_path: Path,
+    delay_seconds: float,
+    resume: bool,
+    headless: bool,
+    storage_state_path: Path | None,
+    save_debug_bundle: bool = False,
+) -> None:
+    try:
+        from src.pipelines.facebook_search_pipeline import (
+            load_keywords_file,
+            run_facebook_multi_search_pipeline,
+            run_facebook_search_manifest_pipeline,
+        )
+        from src.search.google_pse import GooglePSESearchError
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+
+    if manifest_path is not None:
+        print(f"Collecting Facebook posts from search manifest: {manifest_path}")
+        try:
+            summary = run_facebook_search_manifest_pipeline(
+                manifest_path=manifest_path,
+                storage_state_path=storage_state_path,
+                output_path=output_path,
+                delay_seconds=delay_seconds,
+                headless=headless,
+                resume=resume,
+                save_debug_bundle=save_debug_bundle,
+            )
+        except (ValueError, OSError, RuntimeError) as exc:
+            raise SystemExit(f"Facebook search manifest collection failed: {exc}") from exc
+        _print_facebook_search_summary(summary, output_path)
+        return
+
+    try:
+        selected_keywords = load_keywords_file(keywords_file) if keywords_file is not None else (keywords or [])
+    except ValueError as exc:
+        raise SystemExit(f"Facebook search collection failed: {exc}") from exc
+
+    print(f"Searching Google PSE and collecting Facebook posts for {len(selected_keywords)} keyword(s).")
+    try:
+        summary = run_facebook_multi_search_pipeline(
+            keywords=selected_keywords,
+            max_results=max_results,
+            storage_state_path=storage_state_path,
+            output_path=output_path,
+            delay_seconds=delay_seconds,
+            headless=headless,
+            resume=resume,
+            save_debug_bundle=save_debug_bundle,
+        )
+    except (ValueError, OSError, RuntimeError, GooglePSESearchError) as exc:
+        raise SystemExit(f"Facebook search collection failed: {exc}") from exc
+
+    _print_facebook_search_summary(summary, output_path)
+
+
+def _print_facebook_search_summary(summary: dict[str, object], output_path: Path) -> None:
+    print(
+        "Facebook search collection finished: "
+        f"{summary['search_result_count']} search result(s), "
+        f"{summary['batch_input_count']} accepted, "
+        f"{summary['rejected_count']} rejected, "
+        f"{summary['duplicate_count']} duplicate(s)."
+    )
+    if not summary["batch_started"]:
+        print("No supported Facebook post URLs found; Facebook batch was not started.")
+        print(f"JSONL output was not written or modified: {output_path}")
+    else:
+        current = summary["batch_current_run"]
+        print(
+            "Facebook batch finished: "
+            f"{current['success_count']} success/partial, "
+            f"{current['failed_count']} failed, "
+            f"{current['skipped_count']} skipped."
+        )
+        print(f"JSONL written to {output_path}")
+    print(f"Pipeline summary written to {summary['summary_path']}")
 
 
 def _raise_playwright_install_error(exc: ModuleNotFoundError) -> None:

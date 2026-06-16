@@ -40,9 +40,13 @@ storage_state.json
 cookies.json
 
 # Runtime output
-output/*.json
+output/*
+!output/.gitkeep
 output/debug/
+output/archive_legacy/
 logs/*.log
+*.tmp
+.*.tmp
 
 # Keep empty directories
 !output/.gitkeep

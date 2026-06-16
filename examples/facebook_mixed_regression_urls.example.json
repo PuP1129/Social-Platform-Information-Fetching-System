@@ -1,0 +1,26 @@
+[
+  {
+    "url": "https://www.facebook.com/story.php?story_fbid=1449348982581954&id=326121328238064",
+    "label": "story_page_genshin_official_success"
+  },
+  {
+    "url": "https://www.facebook.com/story.php?story_fbid=1035071751957724&id=100063647256368",
+    "label": "story_page_mcdonalds_zero_comments"
+  },
+  {
+    "url": "https://www.facebook.com/char.wright.160890/posts/pfbid0c9s5BtbDn7tvdtb6aCwf6ezGz7dnNdcuV7aeFEL1sReyoUbHVwqg83iRooSq1yddl",
+    "label": "profile_pfbid_success_relative_time"
+  },
+  {
+    "url": "https://www.facebook.com/groups/mybookloversclub/posts/8702397713162461",
+    "label": "group_post_two_metric_summary"
+  },
+  {
+    "url": "https://www.facebook.com/groups/TwoGirlsMustReads/posts/1805183203614163",
+    "label": "group_post_missing_share_metric"
+  },
+  {
+    "url": "https://www.facebook.com/story.php?story_fbid=999999999999999999&id=999999999999999999",
+    "label": "expected_unavailable_or_not_found"
+  }
+]

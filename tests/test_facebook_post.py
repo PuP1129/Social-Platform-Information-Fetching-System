@@ -1130,6 +1130,83 @@ class FacebookActionMetricTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_extracts_partial_ordered_action_bar_numbers_without_share_count(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+            <span dir="auto">4</span>
+            <span dir="auto">48</span>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 4)
+                self.assertEqual(comment_count, 48)
+                self.assertIsNone(share_count)
+            finally:
+                browser.close()
+
+    def test_extracts_semantic_action_button_aria_labels(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button" aria-label="Like: 4 people"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button" aria-label="26 comments"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button" aria-label="1 share"><div data-ad-rendering-role="share_button"></div></div>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 4)
+                self.assertEqual(comment_count, 26)
+                self.assertEqual(share_count, 1)
+            finally:
+                browser.close()
+
+    def test_partial_ordered_summary_ignores_comment_permalink_numbers(self) -> None:
+        html = """
+        <div id="target">
+          <div id="bar">
+            <div role="button"><div data-ad-rendering-role="like_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="comment_button"></div></div>
+            <div role="button"><div data-ad-rendering-role="share_button"></div></div>
+            <span dir="auto">4</span>
+            <span dir="auto">48</span>
+          </div>
+          <div role="article">
+            <a href="/groups/book/posts/8702397713162461?comment_id=999999">999999</a>
+            <span>12 replies</span>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                like_count, comment_count, share_count = _extract_metrics(page.locator("#target"))
+
+                self.assertEqual(like_count, 4)
+                self.assertEqual(comment_count, 48)
+                self.assertIsNone(share_count)
+            finally:
+                browser.close()
+
     def test_summary_parser_supports_large_metric_formats(self) -> None:
         html = """
         <div id="target">
