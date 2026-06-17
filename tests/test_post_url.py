@@ -76,6 +76,11 @@ class ClassifyFacebookPostUrlTests(unittest.TestCase):
                 "https://www.facebook.com/openai/posts/1234567890",
             ),
             (
+                "https://web.facebook.com/openai/posts/1234567890?ref=share",
+                "1234567890",
+                "https://www.facebook.com/openai/posts/1234567890",
+            ),
+            (
                 "https://www.facebook.com/permalink.php?story_fbid=1234567890&id=987654321",
                 "1234567890",
                 "https://www.facebook.com/permalink.php?story_fbid=1234567890&id=987654321",

@@ -1,13 +1,13 @@
 {
-  "job_name": "facebook-text-monitor",
+  "job_name": "facebook-smoke-v2",
   "platform": "facebook",
   "keywords": [
     "Genshin Impact",
     "HoYoverse"
   ],
   "search": {
-    "max_results_per_keyword": 20,
-    "page_size": 10
+    "max_results_per_keyword": 5,
+    "page_size": 5
   },
   "facebook": {
     "storage_state": ".playwright/facebook_storage_state.json",
@@ -19,15 +19,15 @@
     "enabled": true,
     "max_comments_per_post": 20,
     "expand_comments": true,
-    "max_expand_actions": 30,
+    "max_expand_actions": 10,
     "no_progress_round_limit": 3
   },
   "retry": {
-    "max_attempts": 2,
-    "retry_delay_seconds": 5
+    "max_attempts": 1,
+    "retry_delay_seconds": 3
   },
   "history": {
-    "enabled": true,
+    "enabled": false,
     "index_path": "output/history/facebook_posts.jsonl",
     "skip_statuses": [
       "success",

@@ -14,6 +14,7 @@ FACEBOOK_HOSTS = {
     "facebook.com",
     "www.facebook.com",
     "m.facebook.com",
+    "web.facebook.com",
 }
 
 

@@ -8,6 +8,7 @@
 - 单个 Facebook 公开帖子基础采集
 - Facebook 批量采集与 debug bundle
 - 多关键词 Facebook 搜索到批量采集的 pipeline
+- 配置驱动的 Facebook run 目录、内部结果/最终结果分离、CSV、报告和结构化日志
 
 X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控制即可查看的内容；项目不实现验证码绕过、代理池或平台访问控制绕过。
 
@@ -113,6 +114,74 @@ X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控
 - `examples/facebook_search_manifest.example.json`
 - `configs/facebook_job.example.json`
 
+## Facebook Job Config
+
+配置驱动模式会为每次运行创建标准目录：
+
+```text
+output/runs/<job_name>/<run_id>/
+├── job_config.snapshot.json
+├── search_results.json
+├── filter_results.json
+├── manifest.json
+├── pipeline_state.json
+├── internal_results.jsonl
+├── results.jsonl
+├── failed_items.jsonl
+├── summary.json
+├── results.csv
+├── report.md
+├── logs.jsonl
+└── debug/
+```
+
+运行：
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --facebook-job-config "configs/facebook_job.example.json"
+```
+
+常用控制：
+
+```powershell
+.\.venv\Scripts\python.exe main.py --facebook-resume-run "output/runs/facebook-text-monitor/<run_id>"
+.\.venv\Scripts\python.exe main.py --facebook-retry-failed-run "output/runs/facebook-text-monitor/<run_id>"
+.\.venv\Scripts\python.exe main.py --facebook-export-run "output/runs/facebook-text-monitor/<run_id>"
+```
+
+`--facebook-ignore-history` 可在配置模式下临时关闭跨运行历史去重。配置中只保存 storage-state 路径，不保存 Cookie、账号密码或 storage-state 内容。
+
+### Internal Result 与 Final Result
+
+`internal_results.jsonl` 保留工程字段，例如 URL、post_id、状态、错误、debug 路径和输入 metadata。
+
+`results.jsonl` 面向用户，每行严格只有 8 个字段：
+
+```json
+{
+  "author": "",
+  "content": "",
+  "publish_time": "",
+  "like_count": null,
+  "share_count": null,
+  "comment_count": null,
+  "comments": []
+}
+```
+
+每条评论只包含：
+
+```json
+{
+  "comment_content": "",
+  "comment_time": "",
+  "comment_author": ""
+}
+```
+
+未知数量使用空字符串；页面明确显示 0 时保留整数 `0`。`results.csv` 使用 `utf-8-sig`，方便 Windows Excel 打开中文内容。
+
 ## 清理生成物
 
 查看将被清理的 Python 缓存：
@@ -139,7 +208,7 @@ X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控
 
 ## 当前未实现
 
-- Facebook 评论详情采集
+- 完整 Facebook 评论/楼中楼深度采集
 - Facebook 自动登录或账号密码登录
 - Reel、Watch、视频页、照片页专项采集
 - X 评论采集

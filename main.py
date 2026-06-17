@@ -35,6 +35,10 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Run Facebook batch from a saved Facebook search manifest without Google PSE.",
     )
+    input_group.add_argument("--facebook-job-config", type=Path, help="Run a Facebook collection job from JSON config.")
+    input_group.add_argument("--facebook-resume-run", type=Path, help="Resume a Facebook run directory.")
+    input_group.add_argument("--facebook-retry-failed-run", type=Path, help="Retry retryable failed items in a Facebook run.")
+    input_group.add_argument("--facebook-export-run", type=Path, help="Rebuild final JSONL, CSV, and report from a Facebook run.")
     parser.add_argument("--headless", action="store_true", help="Run Chromium in headless mode.")
     parser.add_argument("--max-results", type=int, default=10, help="Maximum number of merged Google PSE results to save.")
     parser.add_argument(
@@ -82,6 +86,11 @@ def parse_args() -> argparse.Namespace:
         "--facebook-save-debug-bundle",
         action="store_true",
         help="Save a full Facebook debug bundle even for successful extractions.",
+    )
+    parser.add_argument(
+        "--facebook-ignore-history",
+        action="store_true",
+        help="Ignore cross-run Facebook history when using --facebook-job-config.",
     )
     return parser.parse_args()
 
@@ -146,6 +155,19 @@ def main() -> None:
             storage_state_path=args.facebook_storage_state,
             save_debug_bundle=args.facebook_save_debug_bundle,
         )
+    elif args.facebook_job_config:
+        run_facebook_job_config_mode(
+            args.facebook_job_config,
+            headless=args.headless,
+            storage_state_path=args.facebook_storage_state,
+            ignore_history=args.facebook_ignore_history,
+        )
+    elif args.facebook_resume_run:
+        run_facebook_resume_run(args.facebook_resume_run)
+    elif args.facebook_retry_failed_run:
+        run_facebook_retry_failed_run(args.facebook_retry_failed_run)
+    elif args.facebook_export_run:
+        run_facebook_export_run(args.facebook_export_run)
     else:
         run_facebook_search_collection(
             keywords=args.facebook_search_keyword,
@@ -388,6 +410,75 @@ def _print_facebook_search_summary(summary: dict[str, object], output_path: Path
         )
         print(f"JSONL written to {output_path}")
     print(f"Pipeline summary written to {summary['summary_path']}")
+
+
+def run_facebook_job_config_mode(
+    config_path: Path,
+    headless: bool,
+    storage_state_path: Path | None,
+    ignore_history: bool,
+) -> None:
+    try:
+        from src.pipelines.facebook_job_pipeline import run_facebook_job_config
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+    print(f"Running Facebook job config: {config_path}")
+    try:
+        summary = run_facebook_job_config(
+            config_path,
+            headless_override=headless if headless else None,
+            storage_state_override=storage_state_path,
+            ignore_history=ignore_history,
+        )
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise SystemExit(f"Facebook job failed: {exc}") from exc
+    _print_facebook_job_summary(summary)
+
+
+def run_facebook_resume_run(run_dir: Path) -> None:
+    from src.pipelines.facebook_job_pipeline import resume_facebook_run
+
+    print(f"Resuming Facebook run: {run_dir}")
+    try:
+        summary = resume_facebook_run(run_dir)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise SystemExit(f"Facebook run resume failed: {exc}") from exc
+    _print_facebook_job_summary(summary)
+
+
+def run_facebook_retry_failed_run(run_dir: Path) -> None:
+    from src.pipelines.facebook_job_pipeline import retry_failed_facebook_run
+
+    print(f"Retrying failed Facebook items from run: {run_dir}")
+    try:
+        summary = retry_failed_facebook_run(run_dir)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise SystemExit(f"Facebook failed-item retry failed: {exc}") from exc
+    _print_facebook_job_summary(summary)
+
+
+def run_facebook_export_run(run_dir: Path) -> None:
+    from src.pipelines.facebook_job_pipeline import export_facebook_run
+
+    print(f"Exporting Facebook run: {run_dir}")
+    try:
+        summary = export_facebook_run(run_dir)
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise SystemExit(f"Facebook run export failed: {exc}") from exc
+    _print_facebook_job_summary(summary)
+
+
+def _print_facebook_job_summary(summary: dict[str, object]) -> None:
+    print(
+        "Facebook job finished: "
+        f"{summary.get('success_count', 0)} success, "
+        f"{summary.get('partial_count', 0)} partial, "
+        f"{summary.get('failed_count', 0)} failed, "
+        f"{summary.get('skipped_count', 0)} skipped."
+    )
+    print(f"Run directory: {summary.get('run_dir')}")
+    print(f"Final JSONL: {summary.get('final_results_path')}")
+    print(f"CSV: {summary.get('csv_path')}")
 
 
 def _raise_playwright_install_error(exc: ModuleNotFoundError) -> None:

@@ -33,6 +33,7 @@ from src.extractors.facebook_post import (
     extract_facebook_post_from_page,
 )
 from src.filters.post_url import classify_post_url
+from src.retry.facebook_failures import enrich_failure_record
 
 DEFAULT_BATCH_OUTPUT_PATH = Path("output") / "facebook_posts.jsonl"
 DEFAULT_BATCH_SUMMARY_PATH = Path("output") / "facebook_batch_summary.json"
@@ -74,8 +75,17 @@ def run_facebook_batch(
     sleep_fn: Callable[[float], None] = time.sleep,
     playwright_factory: Callable[[], Any] = sync_playwright,
     save_debug_bundle: bool = False,
+    extract_comments: bool = False,
+    max_comments_per_post: int = 20,
+    expand_comments: bool = True,
+    max_comment_expand_actions: int = 3,
+    no_progress_round_limit: int = 3,
+    max_attempts: int = 2,
+    progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Collect Facebook posts sequentially into JSONL."""
+    if max_attempts < 1:
+        raise ValueError("Facebook batch max_attempts must be greater than 0.")
     storage_state = _validate_storage_state_path(storage_state_path)
     items = prepare_facebook_batch_items(input_path, limit=limit)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +138,9 @@ def run_facebook_batch(
                 failure_types["batch_stopped_due_to_login_wall"] += 1
                 continue
 
+            print(f"[{index}/{len(items)}] collecting {item.post_id}")
+            if progress_callback is not None:
+                progress_callback("item_started", {"index": index, "total": len(items), "post_id": item.post_id})
             record, error_type = _process_supported_item(
                 index=index,
                 item=item,
@@ -136,6 +149,12 @@ def run_facebook_batch(
                 diagnostics_dir=diagnostics_dir,
                 timeout_ms=timeout_ms,
                 save_debug_bundle=save_debug_bundle,
+                extract_comments=extract_comments,
+                max_comments_per_post=max_comments_per_post,
+                expand_comments=expand_comments,
+                max_comment_expand_actions=max_comment_expand_actions,
+                no_progress_round_limit=no_progress_round_limit,
+                max_attempts=max_attempts,
             )
             _append_jsonl_record(active_output_path, record)
             current_records.append(record)
@@ -143,12 +162,49 @@ def run_facebook_batch(
             processed_urls.add(resume_key)
 
             if record.get("collection_status") == "failed" and error_type:
+                print(f"[{index}/{len(items)}] failed: {record.get('failure_category') or error_type}")
+                if progress_callback is not None:
+                    progress_callback(
+                        "item_failed",
+                        {
+                            "index": index,
+                            "total": len(items),
+                            "post_id": item.post_id,
+                            "failure_category": record.get("failure_category"),
+                            "error_type": error_type,
+                        },
+                    )
                 failure_types[error_type] += 1
                 if error_type == "FacebookLoginRequiredError":
                     login_wall_streak += 1
                 else:
                     login_wall_streak = 0
             else:
+                comments_count = len(record.get("comments") or []) if isinstance(record.get("comments"), list) else 0
+                print(f"[{index}/{len(items)}] {record.get('collection_status')}, comments={comments_count}")
+                if progress_callback is not None:
+                    comments_diagnostics = record.get("comments_diagnostics") if isinstance(record.get("comments_diagnostics"), dict) else {}
+                    if comments_diagnostics:
+                        progress_callback(
+                            "comment_expansion_stopped",
+                            {
+                                "index": index,
+                                "total": len(items),
+                                "post_id": item.post_id,
+                                "comment_expansion_actions": comments_diagnostics.get("comment_expansion_actions"),
+                                "comment_expansion_stop_reason": comments_diagnostics.get("comment_expansion_stop_reason"),
+                            },
+                        )
+                    progress_callback(
+                        "item_succeeded",
+                        {
+                            "index": index,
+                            "total": len(items),
+                            "post_id": item.post_id,
+                            "status": record.get("collection_status"),
+                            "comments": comments_count,
+                        },
+                    )
                 login_wall_streak = 0
 
             if delay_seconds > 0 and index < len(items):
@@ -295,9 +351,15 @@ def _process_supported_item(
     diagnostics_dir: Path,
     timeout_ms: int,
     save_debug_bundle: bool = False,
+    extract_comments: bool = False,
+    max_comments_per_post: int = 20,
+    expand_comments: bool = True,
+    max_comment_expand_actions: int = 3,
+    no_progress_round_limit: int = 3,
+    max_attempts: int = 2,
 ) -> tuple[dict[str, Any], str | None]:
     attempts = 0
-    while attempts < 2:
+    while attempts < max_attempts:
         attempts += 1
         page = None
         trace_started = False
@@ -313,11 +375,20 @@ def _process_supported_item(
                     url=item.input_url,
                     timeout_ms=timeout_ms,
                     authenticated=True,
+                    extract_comments=extract_comments,
+                    max_comments=max_comments_per_post,
+                    expand_comments=expand_comments,
+                    max_comment_expand_actions=max_comment_expand_actions,
+                    no_progress_round_limit=no_progress_round_limit,
                 )
             else:
                 payload = extractor(context, item.input_url)
 
             payload = _enrich_success_record(payload, item)
+            payload["attempt_count"] = attempts
+            payload["failure_category"] = None
+            payload["retryable"] = False
+            payload["last_error"] = None
             should_save_bundle = (
                 extractor is None
                 and should_save_facebook_debug_bundle(
@@ -341,12 +412,12 @@ def _process_supported_item(
             payload.update(diagnostics_paths)
             return payload, None
         except Exception as exc:
-            if attempts == 1 and _is_retryable_exception(exc):
+            if attempts < max_attempts and _is_retryable_exception(exc):
                 if trace_started:
                     stop_facebook_trace(context)
                     trace_started = False
                 continue
-            record = _failed_record(item, exc)
+            record = enrich_failure_record(_failed_record(item, exc), attempts)
             if extractor is None and page is not None:
                 if trace_started:
                     trace_error = stop_facebook_trace(context, bundle_dir / "trace.zip")
@@ -363,7 +434,13 @@ def _process_supported_item(
                 stop_facebook_trace(context)
             _close_quietly(page)
 
-    return _failed_record(item, FacebookPostExtractionError("Facebook batch item failed unexpectedly.")), "FacebookPostExtractionError"
+    return (
+        enrich_failure_record(
+            _failed_record(item, FacebookPostExtractionError("Facebook batch item failed unexpectedly.")),
+            attempts,
+        ),
+        "FacebookPostExtractionError",
+    )
 
 
 def copy_latest_facebook_diagnostics(index: int, post_id: str | None, diagnostics_dir: Path) -> dict[str, str | None]:

@@ -16,7 +16,11 @@ from src.extractors.facebook_post import (
     _extract_action_count_details,
     _extract_article_data,
     _extract_author,
+    _extract_comments,
     _extract_metrics,
+    _expand_one_comment_button,
+    _comment_progress_from_scope,
+    _find_comment_expand_button,
     _find_target_article,
     _find_target_article_result,
     _get_visible_text,
@@ -1061,6 +1065,552 @@ class FacebookExtractionResultTests(unittest.TestCase):
         self.assertIsNone(result["share_count"])
 
 
+class FacebookCommentExpansionTests(unittest.TestCase):
+    def _comment_html(self, start: int, end: int, post_id: str = "999") -> str:
+        return "\n".join(
+            f"""
+            <div role="article" aria-label="Comment by User {index}">
+              <a href="/u{index}">User {index}</a>
+              <div data-ad-comet-preview="message">comment {index}</div>
+              <a href="/groups/g/posts/{post_id}/?comment_id={index}">1y</a>
+            </div>
+            """
+            for index in range(start, end + 1)
+        )
+
+    def test_scroll_lazy_loads_from_initial_ten_to_twenty_comments(self) -> None:
+        initial_comments = self._comment_html(1, 10)
+        additional_comments = self._comment_html(11, 20).replace("`", "\\`")
+        html = f"""
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div id="comments">{initial_comments}</div>
+          <span dir="auto" id="progress">10 of 56</span>
+          <div style="height: 800px"></div>
+        </div>
+        <script>
+        let loaded = false;
+        document.querySelector("#dialog").addEventListener("scroll", () => {{
+          if (loaded) return;
+          loaded = true;
+          document.querySelector("#comments").insertAdjacentHTML("beforeend", `{additional_comments}`);
+          document.querySelector("#progress").textContent = "20 of 56";
+        }});
+        </script>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=5,
+                    no_progress_round_limit=2,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 20)
+        self.assertEqual(diagnostics["comments_visible_before"], 10)
+        self.assertEqual(diagnostics["comments_visible_after"], 20)
+        self.assertEqual(diagnostics["comment_ids_before"], 10)
+        self.assertEqual(diagnostics["comment_ids_after"], 20)
+        self.assertEqual(diagnostics["comment_progress_text"], "20 of 56")
+        self.assertEqual(diagnostics["comment_total_from_progress"], 56)
+        self.assertEqual(diagnostics["comment_loading_mode"], "scroll")
+        self.assertEqual(diagnostics["comment_scroll_actions"], 1)
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "max_comments_reached")
+        self.assertIn("comment_scroll_started", [event["event"] for event in diagnostics["comment_loading_events"]])
+        self.assertIn("comment_scroll_progress", [event["event"] for event in diagnostics["comment_loading_events"]])
+
+    def test_first_scroll_without_progress_then_second_scroll_loads_comments(self) -> None:
+        initial_comments = self._comment_html(1, 10)
+        additional_comments = self._comment_html(11, 20).replace("`", "\\`")
+        html = f"""
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div id="comments">{initial_comments}</div>
+          <span dir="auto" id="progress">10 of 56</span>
+          <div style="height: 1400px"></div>
+        </div>
+        <script>
+        let scrollCount = 0;
+        document.querySelector("#dialog").addEventListener("scroll", () => {{
+          scrollCount += 1;
+          if (scrollCount < 2 || document.querySelector('[href*="comment_id=20"]')) return;
+          document.querySelector("#comments").insertAdjacentHTML("beforeend", `{additional_comments}`);
+          document.querySelector("#progress").textContent = "20 of 56";
+        }});
+        </script>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=5,
+                    no_progress_round_limit=2,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 20)
+        self.assertEqual(diagnostics["comment_scroll_actions"], 2)
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "max_comments_reached")
+
+    def test_scroll_stops_after_consecutive_no_progress_rounds(self) -> None:
+        initial_comments = self._comment_html(1, 10)
+        html = f"""
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div id="comments">{initial_comments}</div>
+          <span dir="auto">10 of 56</span>
+          <div style="height: 1400px"></div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=5,
+                    no_progress_round_limit=2,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 10)
+        self.assertEqual(diagnostics["comment_scroll_actions"], 2)
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "no_progress_round_limit")
+
+    def test_scroll_counts_only_target_dialog_comment_ids(self) -> None:
+        target_comments = self._comment_html(1, 10)
+        other_comments = self._comment_html(101, 110)
+        html = f"""
+        <div role="dialog" id="target-dialog" style="height: 120px; overflow-y: auto;">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div id="comments">{target_comments}</div>
+          <span dir="auto">10 of 56</span>
+          <div style="height: 800px"></div>
+        </div>
+        <div role="dialog" id="other-dialog">
+          {other_comments}
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=1,
+                    no_progress_round_limit=1,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 10)
+        self.assertEqual(diagnostics["comment_ids_before"], 10)
+        self.assertEqual(diagnostics["comment_ids_after"], 10)
+
+    def test_button_strategy_is_still_preferred_over_scroll(self) -> None:
+        html = """
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;" onscroll="window.scrolled = true">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+          <div role="button" onclick="window.clicked = true">
+            <span><span dir="auto">View more comments</span></span>
+          </div>
+          <span dir="auto">1 of 3</span>
+          <div style="height: 800px"></div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=10,
+                    expand_comments=True,
+                    max_expand_actions=1,
+                    no_progress_round_limit=1,
+                )
+                clicked = page.evaluate("window.clicked === true")
+                scrolled = page.evaluate("window.scrolled === true")
+            finally:
+                browser.close()
+
+        self.assertTrue(clicked)
+        self.assertFalse(scrolled)
+        self.assertEqual(diagnostics["comment_loading_mode"], "button")
+        self.assertEqual(diagnostics["comment_expansion_actions"], 1)
+        self.assertEqual(diagnostics["comment_scroll_actions"], 0)
+
+    def test_unusable_button_falls_back_to_scroll(self) -> None:
+        initial_comments = self._comment_html(1, 10)
+        additional_comments = self._comment_html(11, 20).replace("`", "\\`")
+        html = f"""
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div id="comments">{initial_comments}</div>
+          <div role="button" style="display: none">
+            <span><span dir="auto">View more comments</span></span>
+          </div>
+          <span dir="auto" id="progress">10 of 56</span>
+          <div style="height: 1000px"></div>
+        </div>
+        <script>
+        document.querySelector("#dialog").addEventListener("scroll", () => {{
+          if (document.querySelector('[href*="comment_id=20"]')) return;
+          document.querySelector("#comments").insertAdjacentHTML("beforeend", `{additional_comments}`);
+          document.querySelector("#progress").textContent = "20 of 56";
+        }});
+        </script>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=3,
+                    no_progress_round_limit=2,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 20)
+        self.assertEqual(diagnostics["comment_loading_mode"], "scroll")
+        self.assertTrue(diagnostics["comment_expand_candidate_found"])
+        self.assertFalse(diagnostics["comment_expand_button_found"])
+        self.assertFalse(diagnostics["comment_expansion_click_failed"])
+        self.assertEqual(diagnostics["comment_scroll_actions"], 1)
+
+    def test_span_text_button_ancestor_is_clicked_and_progress_total_is_used(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div id="target">
+            <a href="/groups/g/posts/999">Post permalink</a>
+            <div data-ad-comet-preview="message">Main post</div>
+          </div>
+          <div id="comments">
+            <div role="article" aria-label="Comment by A">
+              <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+              <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+            </div>
+            <div role="article" aria-label="Comment by B">
+              <a href="/b">B</a><div data-ad-comet-preview="message">two</div>
+              <a href="/groups/g/posts/999/?comment_id=2">1y</a>
+            </div>
+            <div role="article" aria-label="Comment by C">
+              <a href="/c">C</a><div data-ad-comet-preview="message">three</div>
+              <a href="/groups/g/posts/999/?comment_id=3">1y</a>
+            </div>
+          </div>
+          <div id="comment-controls">
+            <div role="button" tabindex="0" onclick="addMoreComments()">
+              <span><span dir="auto">View more comments</span></span>
+            </div>
+            <span dir="auto" id="progress">3 of 23</span>
+          </div>
+        </div>
+        <script>
+        function addMoreComments() {
+          const comments = document.querySelector("#comments");
+          comments.insertAdjacentHTML("beforeend", `
+            <div role="article" aria-label="Comment by D">
+              <a href="/d">D</a><div data-ad-comet-preview="message">four</div>
+              <a href="/groups/g/posts/999/?comment_id=4">1y</a>
+            </div>
+            <div role="article" aria-label="Comment by E">
+              <a href="/e">E</a><div data-ad-comet-preview="message">five</div>
+              <a href="/groups/g/posts/999/?comment_id=5">1y</a>
+            </div>
+          `);
+          document.querySelector("#progress").textContent = "5 of 23";
+          document.querySelector("#comment-controls [role=button]").remove();
+        }
+        </script>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=100,
+                    expand_comments=True,
+                    max_expand_actions=3,
+                    no_progress_round_limit=2,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 5)
+        self.assertEqual(diagnostics["comments_visible_before"], 3)
+        self.assertEqual(diagnostics["comments_visible_after"], 5)
+        self.assertEqual(diagnostics["comment_progress_text"], "5 of 23")
+        self.assertEqual(diagnostics["comment_total_from_progress"], 23)
+        self.assertTrue(diagnostics["comment_expand_button_found"])
+        self.assertTrue(diagnostics["comment_expand_candidate_found"])
+        self.assertTrue(diagnostics["comment_expansion_clicked"])
+        self.assertFalse(diagnostics["comment_expansion_click_failed"])
+        self.assertEqual(diagnostics["comment_expansion_actions"], 1)
+
+    def test_find_comment_expand_button_returns_clickable_button_ancestor(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div role="button" tabindex="0" id="real-button">
+            <span><span dir="auto" id="text-node">View more comments</span></span>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                button_info = _find_comment_expand_button(page.locator("#dialog"))
+                button_id = button_info["button"].get_attribute("id")
+                tag_name = button_info["button"].evaluate("(node) => node.tagName.toLowerCase()")
+            finally:
+                browser.close()
+
+        self.assertTrue(button_info["candidate_found"])
+        self.assertEqual(button_id, "real-button")
+        self.assertEqual(tag_name, "div")
+        self.assertIsNone(button_info["reason"])
+
+    def test_comment_progress_parser_uses_local_control_area(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div role="button"><span><span dir="auto">View previous comments</span></span></div>
+          <span dir="auto">3 of 23</span>
+        </div>
+        <div role="dialog" id="other">
+          <div role="button"><span><span dir="auto">View more comments</span></span></div>
+          <span dir="auto">8 of 99</span>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                progress = _comment_progress_from_scope(page.locator("#dialog"))
+            finally:
+                browser.close()
+
+        self.assertEqual(progress["text"], "3 of 23")
+        self.assertEqual(progress["current"], 3)
+        self.assertEqual(progress["total"], 23)
+
+    def test_dialog_scope_finds_button_outside_narrow_target_container(self) -> None:
+        html = """
+        <div role="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+          <div role="button" onclick="window.clicked = true">
+            <span><span dir="auto">More comments</span></span>
+          </div>
+          <span dir="auto">1 of 4</span>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=10,
+                    expand_comments=True,
+                    max_expand_actions=1,
+                    no_progress_round_limit=1,
+                )
+                clicked = page.evaluate("window.clicked === true")
+            finally:
+                browser.close()
+
+        self.assertTrue(clicked)
+        self.assertEqual(diagnostics["comment_expansion_actions"], 1)
+        self.assertEqual(diagnostics["comment_total_from_progress"], 4)
+
+    def test_recommended_area_button_outside_dialog_is_not_clicked(self) -> None:
+        html = """
+        <div role="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+        </div>
+        <aside>
+          <div role="button" onclick="window.badClicked = true">
+            <span><span dir="auto">View more comments</span></span>
+          </div>
+          <span dir="auto">1 of 99</span>
+        </aside>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=10,
+                    expand_comments=True,
+                    max_expand_actions=1,
+                    no_progress_round_limit=1,
+                )
+                bad_clicked = page.evaluate("window.badClicked === true")
+            finally:
+                browser.close()
+
+        self.assertFalse(bad_clicked)
+        self.assertFalse(diagnostics["comment_expand_button_found"])
+        self.assertFalse(diagnostics["comment_expand_candidate_found"])
+        self.assertEqual(diagnostics["comment_expansion_actions"], 0)
+
+    def test_no_progress_stops_after_limited_rounds(self) -> None:
+        html = """
+        <div role="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+          <div role="button"><span><span dir="auto">View more replies</span></span></div>
+          <span dir="auto">1 of 3</span>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=10,
+                    expand_comments=True,
+                    max_expand_actions=5,
+                    no_progress_round_limit=1,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(comments), 1)
+        self.assertEqual(diagnostics["comment_expansion_actions"], 1)
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "no_progress_round_limit")
+
+    def test_hidden_expand_candidate_has_specific_stop_reason(self) -> None:
+        html = """
+        <div role="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+          <div role="button" style="display: none">
+            <span><span dir="auto">View more comments</span></span>
+          </div>
+          <span dir="auto">1 of 3</span>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                _, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=10,
+                    expand_comments=True,
+                    max_expand_actions=3,
+                    no_progress_round_limit=1,
+                )
+            finally:
+                browser.close()
+
+        self.assertTrue(diagnostics["comment_expand_candidate_found"])
+        self.assertFalse(diagnostics["comment_expand_button_found"])
+        self.assertEqual(diagnostics["comment_expansion_actions"], 0)
+        self.assertEqual(diagnostics["comment_scroll_actions"], 1)
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "no_progress_round_limit")
+        self.assertNotEqual(diagnostics["comment_expansion_stop_reason"], "no_more_expand_buttons")
+
+    def test_detached_expand_locator_reports_click_failure_not_no_more_buttons(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div role="article" aria-label="Comment by A">
+            <a href="/a">A</a><div data-ad-comet-preview="message">one</div>
+            <a href="/groups/g/posts/999/?comment_id=1">1y</a>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                with patch(
+                    "src.extractors.facebook_post._find_comment_expand_button",
+                    return_value={
+                        "candidate_found": True,
+                        "button": page.locator("#detached-button"),
+                        "text": "View more comments",
+                        "reason": None,
+                    },
+                ):
+                    result = _expand_one_comment_button(page.locator("#dialog"), "999", 1, None)
+            finally:
+                browser.close()
+
+        self.assertTrue(result["comment_expand_candidate_found"])
+        self.assertTrue(result["comment_expansion_click_failed"])
+        self.assertEqual(result["reason"], "expand_click_failed")
+        self.assertNotEqual(result["reason"], "no_more_expand_buttons")
+
+
 class FacebookActionMetricTests(unittest.TestCase):
     def test_rendering_role_buttons_without_summary_do_not_create_counts(self) -> None:
         html = """
@@ -1270,7 +1820,7 @@ class FacebookActionMetricTests(unittest.TestCase):
                 page.set_content(html)
                 _, comment_count, _ = _extract_metrics(page.locator("#target"))
 
-                self.assertIsNone(comment_count)
+                self.assertEqual(comment_count, 0)
             finally:
                 browser.close()
 
@@ -1353,8 +1903,9 @@ class FacebookActionMetricTests(unittest.TestCase):
 
                 self.assertTrue(details.button_found)
                 self.assertIsNone(details.raw_text)
-                self.assertIsNone(details.count)
-                self.assertEqual(details.rejection_reason, "button_found_but_no_numeric_summary")
+                self.assertEqual(details.count, 0)
+                self.assertIsNone(details.rejection_reason)
+                self.assertEqual(details.count_state, "known_zero")
             finally:
                 browser.close()
 

@@ -20,6 +20,7 @@ from src.debug.facebook_debug_bundle import (
     stop_facebook_trace,
 )
 from src.filters.post_url import classify_post_url
+from src.utils.facebook_time import is_relative_time_text
 from src.utils.metrics import parse_metric_count
 
 DEBUG_OUTPUT_DIR = Path("output") / "debug"
@@ -78,6 +79,7 @@ class ActionCountExtraction:
     count: int | None
     source: str | None = None
     rejection_reason: str | None = None
+    count_state: str = "unknown"
 
 
 def extract_facebook_post(
@@ -86,6 +88,11 @@ def extract_facebook_post(
     timeout_ms: int = 30_000,
     storage_state_path: str | Path | None = None,
     save_debug_bundle: bool = False,
+    extract_comments: bool = False,
+    max_comments: int = 20,
+    expand_comments: bool = True,
+    max_comment_expand_actions: int = 3,
+    no_progress_round_limit: int = 3,
 ) -> dict[str, Any]:
     """Open a public Facebook post page and extract the target main post."""
     classified_url = classify_post_url(url)
@@ -118,6 +125,11 @@ def extract_facebook_post(
             url=url,
             timeout_ms=timeout_ms,
             authenticated=normalized_storage_state_path is not None,
+            extract_comments=extract_comments,
+            max_comments=max_comments,
+            expand_comments=expand_comments,
+            max_comment_expand_actions=max_comment_expand_actions,
+            no_progress_round_limit=no_progress_round_limit,
         )
         should_save = should_save_facebook_debug_bundle(
             str(payload.get("collection_status")),
@@ -165,6 +177,11 @@ def extract_facebook_post_from_page(
     url: str,
     timeout_ms: int = 30_000,
     authenticated: bool = False,
+    extract_comments: bool = False,
+    max_comments: int = 20,
+    expand_comments: bool = True,
+    max_comment_expand_actions: int = 3,
+    no_progress_round_limit: int = 3,
 ) -> dict[str, Any]:
     """Extract one Facebook post using an existing Playwright page."""
     classified_url = classify_post_url(url)
@@ -207,7 +224,18 @@ def extract_facebook_post_from_page(
         )
 
     target_article = target_selection.locator
-    result = _extract_article_data(target_article, url, canonical_url, post_id, context_type=context_type)
+    result = _extract_article_data(
+        target_article,
+        url,
+        canonical_url,
+        post_id,
+        context_type=context_type,
+        extract_comments=extract_comments,
+        max_comments=max_comments,
+        expand_comments=expand_comments,
+        max_comment_expand_actions=max_comment_expand_actions,
+        no_progress_round_limit=no_progress_round_limit,
+    )
     if result["publish_time"] is None and result.get("publish_time_text") is None:
         publish_time, publish_time_text = _extract_publish_time(target_article, post_id)
         result = _apply_publish_time_to_result(result, publish_time, publish_time_text)
@@ -1191,13 +1219,36 @@ def _extract_article_data(
     canonical_url: str,
     post_id: str,
     context_type: str | None = None,
+    extract_comments: bool = False,
+    max_comments: int = 20,
+    expand_comments: bool = True,
+    max_comment_expand_actions: int = 3,
+    no_progress_round_limit: int = 3,
 ) -> dict[str, Any]:
     author = _extract_author(article)
     content = _extract_content(article)
     publish_time, publish_time_text = _extract_publish_time(article, post_id)
     like_count, comment_count, share_count = _extract_metrics(article)
+    comment_scope = _comment_scope(article)
+    comment_progress = _comment_progress_from_scope(comment_scope)
+    if comment_count is None and isinstance(comment_progress.get("total"), int):
+        comment_count = int(comment_progress["total"])
+    comments, comments_diagnostics = (
+        _extract_comments(
+            article,
+            post_id,
+            max_comments,
+            expand_comments,
+            max_comment_expand_actions,
+            no_progress_round_limit,
+            comment_scope=comment_scope,
+            initial_progress=comment_progress,
+        )
+        if extract_comments and max_comments > 0
+        else ([], {"enabled": False})
+    )
 
-    return _build_extraction_result(
+    result = _build_extraction_result(
         post_id=post_id,
         input_url=input_url,
         canonical_url=canonical_url,
@@ -1208,10 +1259,14 @@ def _extract_article_data(
         like_count=like_count,
         comment_count=comment_count,
         share_count=share_count,
+        comments=comments,
         extraction_source="dom",
         metadata_error=None,
         context_type=context_type,
     )
+    if extract_comments:
+        result["comments_diagnostics"] = comments_diagnostics
+    return result
 
 
 def _build_extraction_result(
@@ -1228,6 +1283,7 @@ def _build_extraction_result(
     extraction_source: str,
     metadata_error: str | None,
     context_type: str | None = None,
+    comments: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     has_author = bool(author["name"] or author["profile_url"])
     has_content = bool(content)
@@ -1260,7 +1316,7 @@ def _build_extraction_result(
         "like_count": like_count,
         "share_count": share_count,
         "comment_count": comment_count,
-        "comments": [],
+        "comments": comments or [],
         "collected_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "collection_status": status,
         "extraction_source": extraction_source,
@@ -1339,6 +1395,7 @@ def _build_metadata_result(
         like_count=None,
         comment_count=None,
         share_count=None,
+        comments=[],
         extraction_source="page_metadata",
         metadata_error="Full Facebook post DOM was unavailable.",
         context_type=context_type,
@@ -1422,6 +1479,718 @@ def _extract_content(article: Locator) -> str | None:
     if dialog_text:
         return dialog_text
     return _extract_fallback_content(article)
+
+
+def _extract_comments(
+    article: Locator,
+    post_id: str,
+    max_comments: int,
+    expand_comments: bool,
+    max_expand_actions: int,
+    no_progress_round_limit: int,
+    comment_scope: Locator | None = None,
+    initial_progress: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    if max_comments <= 0:
+        return [], {"enabled": True, "comments_collected_count": 0, "comment_expansion_stop_reason": "max_comments_zero"}
+    scope = comment_scope or _comment_scope(article)
+    comments: list[dict[str, str]] = []
+    seen: set[str] = set()
+    expansion_actions = 0
+    no_progress_rounds = 0
+    stop_reason = "no_expand_requested" if not expand_comments else "no_more_expand_buttons"
+    progress = initial_progress or _comment_progress_from_scope(scope, allow_without_button=True)
+    initial_current_comments = _extract_current_comments(scope, post_id)
+    comments_visible_before = len(initial_current_comments)
+    comments_visible_after = comments_visible_before
+    comment_ids_before = _comment_id_set(initial_current_comments)
+    comment_ids_after = set(comment_ids_before)
+    expand_button_found = bool(progress.get("button_found"))
+    expand_candidate_found = bool(progress.get("comment_expand_candidate_found") or progress.get("button_found"))
+    expansion_clicked = False
+    expansion_click_failed = False
+    scroll_actions = 0
+    loading_mode: str | None = None
+    loading_events: list[dict[str, Any]] = []
+
+    def collect_current_comments() -> int:
+        nonlocal comments_visible_after, comment_ids_after
+        current_comments = _extract_current_comments(scope, post_id)
+        comments_visible_after = len(current_comments)
+        comment_ids_after = _comment_id_set(current_comments)
+        for current_comment in current_comments:
+            key = _comment_dedupe_key(current_comment)
+            if key in seen:
+                continue
+            seen.add(key)
+            comments.append(current_comment)
+            if len(comments) >= max_comments:
+                break
+        return len(current_comments)
+
+    collect_current_comments()
+    while True:
+        if len(comments) >= max_comments:
+            stop_reason = "max_comments_reached"
+            break
+        if not expand_comments:
+            break
+        if expansion_actions + scroll_actions >= max_expand_actions:
+            stop_reason = "max_expand_actions_reached"
+            break
+        if no_progress_rounds >= no_progress_round_limit:
+            stop_reason = "no_progress_round_limit"
+            break
+        progress_total = progress.get("total")
+        if isinstance(progress_total, int) and len(comments) >= progress_total:
+            stop_reason = "displayed_comment_total_reached"
+            break
+
+        before_unique_count = len(comments)
+        before_visible_count = comments_visible_after
+        before_progress_current = progress.get("current")
+        before_comment_ids = set(comment_ids_after)
+        expand_result = _expand_one_comment_button(scope, post_id, before_visible_count, before_progress_current)
+        expand_button_found = expand_button_found or bool(expand_result.get("button_found"))
+        expand_candidate_found = expand_candidate_found or bool(expand_result.get("comment_expand_candidate_found"))
+        expansion_clicked = expansion_clicked or bool(expand_result.get("comment_expansion_clicked"))
+        expansion_click_failed = expansion_click_failed or bool(expand_result.get("comment_expansion_click_failed"))
+        next_progress = expand_result.get("progress") or _comment_progress_from_scope(scope)
+        if next_progress.get("text") or not progress.get("text"):
+            progress = next_progress
+        button_clicked = bool(expand_result.get("clicked"))
+        scroll_result: dict[str, Any] | None = None
+        if button_clicked:
+            expansion_actions += 1
+            loading_mode = "button" if loading_mode is None else "mixed"
+        else:
+            if expansion_actions + scroll_actions >= max_expand_actions:
+                stop_reason = "max_expand_actions_reached"
+                break
+            loading_events.append(
+                {
+                    "event": "comment_scroll_started",
+                    "comments_visible": comments_visible_after,
+                    "comment_id_count": len(comment_ids_after),
+                }
+            )
+            scroll_result = _scroll_comment_scope(scope, post_id)
+            if not scroll_result.get("scrolled"):
+                stop_reason = str(scroll_result.get("reason") or expand_result.get("reason") or "comment_scroll_unavailable")
+                loading_events.append(
+                    {
+                        "event": "comment_scroll_stopped",
+                        "reason": stop_reason,
+                        "comments_visible": comments_visible_after,
+                        "comment_id_count": len(comment_ids_after),
+                    }
+                )
+                break
+            scroll_actions += 1
+            loading_mode = "scroll" if loading_mode is None else "mixed"
+            next_progress = _comment_progress_from_scope(scope, allow_without_button=True)
+            if next_progress.get("text") or not progress.get("text"):
+                progress = next_progress
+        after_visible_count = collect_current_comments()
+        after_progress_current = progress.get("current")
+        progressed = (
+            len(comments) > before_unique_count
+            or after_visible_count > before_visible_count
+            or len(comment_ids_after) > len(before_comment_ids)
+            or (
+                isinstance(before_progress_current, int)
+                and isinstance(after_progress_current, int)
+                and after_progress_current > before_progress_current
+            )
+            or bool(expand_result.get("button_changed"))
+            or bool(scroll_result and scroll_result.get("progressed"))
+        )
+        if progressed:
+            no_progress_rounds = 0
+            if scroll_result is not None:
+                loading_events.append(
+                    {
+                        "event": "comment_scroll_progress",
+                        "comments_visible": comments_visible_after,
+                        "comment_id_count": len(comment_ids_after),
+                    }
+                )
+        else:
+            no_progress_rounds += 1
+            if scroll_result is not None:
+                loading_events.append(
+                    {
+                        "event": "comment_scroll_stopped",
+                        "reason": "no_progress",
+                        "comments_visible": comments_visible_after,
+                        "comment_id_count": len(comment_ids_after),
+                    }
+                )
+    return comments, _comment_diagnostics(
+        comments,
+        expansion_actions,
+        stop_reason,
+        progress=progress,
+        comments_visible_before=comments_visible_before,
+        comments_visible_after=comments_visible_after,
+        comment_ids_before=len(comment_ids_before),
+        comment_ids_after=len(comment_ids_after),
+        expand_button_found=expand_button_found,
+        expand_candidate_found=expand_candidate_found,
+        expansion_clicked=expansion_clicked,
+        expansion_click_failed=expansion_click_failed,
+        loading_mode=loading_mode,
+        scroll_actions=scroll_actions,
+        loading_events=loading_events,
+    )
+
+
+def _extract_current_comments(article: Locator, post_id: str) -> list[dict[str, str]]:
+    candidates = article.locator(
+        '[aria-label*="Comment by" i], [aria-label*="Reply by" i], '
+        '[role="article"][aria-label*="comment" i], [role="article"][aria-label*="reply" i]'
+    )
+    comments: list[dict[str, str]] = []
+    for index in range(_safe_count(candidates)):
+        candidate = candidates.nth(index)
+        comment = _extract_comment_from_candidate(candidate, post_id)
+        if comment is None:
+            continue
+        comments.append(comment)
+    return comments
+
+
+def _comment_id_set(comments: list[dict[str, str]]) -> set[str]:
+    return {comment["comment_id"] for comment in comments if comment.get("comment_id")}
+
+
+def _comment_scope(article: Locator) -> Locator:
+    try:
+        if article.evaluate("(node) => node.getAttribute('role') === 'dialog'", timeout=500):
+            return article
+    except PlaywrightError:
+        pass
+    dialog = article.locator("xpath=ancestor::*[@role='dialog'][1]")
+    if _safe_count(dialog) > 0:
+        return dialog.first
+    return article
+
+
+def _scroll_comment_scope(scope: Locator, post_id: str) -> dict[str, Any]:
+    before_ids = _comment_id_set(_extract_current_comments(scope, post_id))
+    current_comments = _extract_current_comments(scope, post_id)
+    if current_comments:
+        last_id = current_comments[-1].get("comment_id")
+        if last_id:
+            last_links = scope.locator(f'a[href*="comment_id={last_id}"]')
+            if _safe_count(last_links) > 0:
+                try:
+                    last_links.last.scroll_into_view_if_needed(timeout=1_000)
+                except PlaywrightError:
+                    pass
+    try:
+        scroll_payload = scope.evaluate(
+            """
+            (node) => {
+              const canScroll = (element) => {
+                if (!element) {
+                  return false;
+                }
+                const style = window.getComputedStyle(element);
+                return /(auto|scroll)/.test(style.overflowY || '') && element.scrollHeight > element.clientHeight + 8;
+              };
+              let current = node;
+              while (current && !canScroll(current)) {
+                current = current.parentElement;
+              }
+              const target = current || node;
+              const before = target.scrollTop || 0;
+              const distance = Math.max(480, Math.floor((target.clientHeight || window.innerHeight || 600) * 0.85));
+              target.scrollTop = before + distance;
+              if (target === document.body || target === document.documentElement) {
+                window.scrollBy(0, distance);
+              }
+              return {
+                before,
+                after: target.scrollTop || before,
+                distance,
+                usedScrollableAncestor: Boolean(current),
+              };
+            }
+            """,
+            timeout=1_000,
+        )
+    except PlaywrightError:
+        return {"scrolled": False, "progressed": False, "reason": "comment_scroll_failed"}
+
+    progressed = False
+    for _ in range(10):
+        _short_wait(scope, 50)
+        after_ids = _comment_id_set(_extract_current_comments(scope, post_id))
+        if len(after_ids) > len(before_ids):
+            progressed = True
+            break
+    return {
+        "scrolled": True,
+        "progressed": progressed,
+        "reason": None,
+        "scroll_payload": scroll_payload if isinstance(scroll_payload, dict) else {},
+    }
+
+
+def _expand_one_comment_button(
+    scope: Locator,
+    post_id: str,
+    previous_visible_count: int,
+    previous_progress_current: Any,
+) -> dict[str, Any]:
+    button_info = _find_comment_expand_button(scope)
+    if button_info.get("button") is None:
+        return {
+            "button_found": False,
+            "comment_expand_candidate_found": bool(button_info.get("candidate_found")),
+            "comment_expansion_click_failed": False,
+            "clicked": False,
+            "button_changed": False,
+            "reason": button_info.get("reason") or "no_more_expand_buttons",
+            "progress": _comment_progress_from_scope(scope),
+        }
+    button = button_info["button"]
+    before_text = str(button_info.get("text") or "")
+    before_progress = _comment_progress_near_button(button)
+    try:
+        button.click(timeout=500)
+    except PlaywrightError:
+        return {
+            "button_found": True,
+            "comment_expand_candidate_found": True,
+            "comment_expansion_click_failed": True,
+            "clicked": False,
+            "button_changed": False,
+            "reason": "expand_click_failed",
+            "progress": before_progress or _comment_progress_from_scope(scope),
+        }
+
+    last_progress = before_progress or _comment_progress_from_scope(scope)
+    button_changed = False
+    for _ in range(10):
+        _short_wait(scope, 50)
+        current_comments = _extract_current_comments(scope, post_id)
+        current_progress = _comment_progress_from_scope(scope, allow_without_button=True)
+        next_button = _find_comment_expand_button(scope)
+        next_text = str(next_button.get("text") or "") if next_button else ""
+        button_changed = next_button is None or (before_text and next_text and next_text != before_text)
+        last_progress = current_progress
+        progress_current = current_progress.get("current")
+        if (
+            len(current_comments) > previous_visible_count
+            or (
+                isinstance(previous_progress_current, int)
+                and isinstance(progress_current, int)
+                and progress_current > previous_progress_current
+            )
+            or button_changed
+        ):
+            break
+    return {
+        "button_found": True,
+        "comment_expand_candidate_found": True,
+        "comment_expansion_clicked": True,
+        "comment_expansion_click_failed": False,
+        "clicked": True,
+        "button_changed": button_changed,
+        "reason": None,
+        "progress": last_progress,
+    }
+
+
+def _find_comment_expand_button(scope: Locator) -> dict[str, Any]:
+    text_nodes = scope.locator('span[dir="auto"], div[dir="auto"]')
+    for index in range(min(_safe_count(text_nodes), 120)):
+        node = text_nodes.nth(index)
+        text = _safe_inner_text(node)
+        if not _is_comment_expand_text(text):
+            continue
+        button = node.locator('xpath=ancestor::div[@role="button"][1]')
+        if _safe_count(button) == 0:
+            return {"candidate_found": True, "button": None, "text": text, "reason": "expand_button_not_clickable"}
+        candidate = button.first
+        status = _comment_expand_button_status(candidate)
+        if status is None:
+            return {"candidate_found": True, "button": candidate, "text": text, "reason": None}
+        return {"candidate_found": True, "button": None, "text": text, "reason": status}
+    return {"candidate_found": False, "button": None, "text": None, "reason": "no_more_expand_buttons"}
+
+
+def _comment_expand_button_status(button: Locator) -> str | None:
+    try:
+        if _safe_count(button) == 0:
+            return "expand_button_detached"
+        if not button.is_visible(timeout=200):
+            return "expand_button_not_clickable"
+        if not button.is_enabled(timeout=200):
+            return "expand_button_not_clickable"
+        return None
+    except PlaywrightError:
+        return "expand_button_detached"
+
+
+def _is_comment_expand_text(value: str | None) -> bool:
+    if not value:
+        return False
+    normalized = " ".join(value.split()).lower()
+    return any(
+        phrase in normalized
+        for phrase in (
+            "view more comments",
+            "see more comments",
+            "view previous comments",
+            "more comments",
+            "view more replies",
+        )
+    )
+
+
+def _comment_progress_from_scope(scope: Locator, allow_without_button: bool = False) -> dict[str, Any]:
+    button_info = _find_comment_expand_button(scope)
+    if button_info.get("button") is None:
+        if allow_without_button:
+            progress = _comment_progress_without_button(scope)
+            if progress.get("text"):
+                return progress
+        return {
+            "button_found": False,
+            "comment_expand_candidate_found": bool(button_info.get("candidate_found")),
+            "text": None,
+            "current": None,
+            "total": None,
+            "reason": button_info.get("reason"),
+        }
+    progress = _comment_progress_near_button(button_info["button"])
+    progress["button_found"] = True
+    progress["comment_expand_candidate_found"] = True
+    return progress
+
+
+def _comment_progress_without_button(scope: Locator) -> dict[str, Any]:
+    texts = scope.locator('span[dir="auto"], div[dir="auto"]')
+    for index in range(min(_safe_count(texts), 80)):
+        text = _safe_inner_text(texts.nth(index))
+        parsed = _parse_comment_progress_text(text)
+        if parsed is not None:
+            return {
+                "button_found": False,
+                "text": parsed["text"],
+                "current": parsed["current"],
+                "total": parsed["total"],
+            }
+    return {
+        "button_found": False,
+        "text": None,
+        "current": None,
+        "total": None,
+    }
+
+
+def _parse_comment_progress_text(value: str | None) -> dict[str, int | str] | None:
+    if not value:
+        return None
+    normalized = " ".join(value.replace("\u00a0", " ").split())
+    match = re.search(r"\b(\d[\d,]*)\s+of\s+(\d[\d,]*)\b", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    current = int(match.group(1).replace(",", ""))
+    total = int(match.group(2).replace(",", ""))
+    return {"text": match.group(0), "current": current, "total": total}
+
+
+def _comment_progress_near_button(button: Locator) -> dict[str, Any]:
+    script = r"""
+    (button) => {
+      const normalize = (value) => (value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+      const parseProgress = (text) => {
+        const match = normalize(text).match(/\b(\d[\d,]*)\s+of\s+(\d[\d,]*)\b/i);
+        if (!match) {
+          return null;
+        }
+        const current = Number.parseInt(match[1].replace(/,/g, ''), 10);
+        const total = Number.parseInt(match[2].replace(/,/g, ''), 10);
+        if (!Number.isFinite(current) || !Number.isFinite(total)) {
+          return null;
+        }
+        return { text: match[0], current, total };
+      };
+      let current = button;
+      for (let depth = 0; current && depth <= 5; depth += 1) {
+        const own = parseProgress(current.innerText || '');
+        if (own) {
+          return own;
+        }
+        const nodes = Array.from(current.querySelectorAll('span[dir="auto"], div[dir="auto"]'));
+        for (const node of nodes) {
+          const parsed = parseProgress(node.innerText || node.textContent || '');
+          if (parsed) {
+            return parsed;
+          }
+        }
+        current = current.parentElement;
+      }
+      return null;
+    }
+    """
+    try:
+        result = button.evaluate(script, timeout=1_000)
+    except PlaywrightError:
+        result = None
+    if isinstance(result, dict):
+        return {
+            "button_found": True,
+            "text": result.get("text") if isinstance(result.get("text"), str) else None,
+            "current": result.get("current") if isinstance(result.get("current"), int) else None,
+            "total": result.get("total") if isinstance(result.get("total"), int) else None,
+        }
+    return {
+        "button_found": True,
+        "text": None,
+        "current": None,
+        "total": None,
+    }
+
+
+def _short_wait(locator: Locator, timeout_ms: int) -> None:
+    try:
+        locator.evaluate("(node, timeout) => new Promise((resolve) => setTimeout(resolve, timeout))", timeout_ms)
+    except PlaywrightError:
+        pass
+
+
+def _comment_dedupe_key(comment: dict[str, str]) -> str:
+    comment_id = comment.get("comment_id")
+    if comment_id:
+        return f"comment_id:{comment_id}"
+    return "fallback:" + "|".join(
+        " ".join(str(comment.get(field, "")).lower().split())
+        for field in ("comment_author", "comment_content", "comment_time")
+    )
+
+
+def _comment_diagnostics(
+    comments: list[dict[str, str]],
+    expansion_actions: int,
+    stop_reason: str,
+    progress: dict[str, Any] | None = None,
+    comments_visible_before: int | None = None,
+    comments_visible_after: int | None = None,
+    comment_ids_before: int | None = None,
+    comment_ids_after: int | None = None,
+    expand_button_found: bool = False,
+    expand_candidate_found: bool = False,
+    expansion_clicked: bool = False,
+    expansion_click_failed: bool = False,
+    loading_mode: str | None = None,
+    scroll_actions: int = 0,
+    loading_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    progress = progress or {}
+    resolved_loading_mode = loading_mode
+    if resolved_loading_mode is None:
+        resolved_loading_mode = "button" if expansion_actions > 0 else ("scroll" if scroll_actions > 0 else None)
+    return {
+        "comments_collected_count": len(comments),
+        "comments_complete": False,
+        "comment_loading_mode": resolved_loading_mode,
+        "comment_progress_text": progress.get("text"),
+        "comments_visible_before": comments_visible_before,
+        "comments_visible_after": comments_visible_after,
+        "comment_ids_before": comment_ids_before,
+        "comment_ids_after": comment_ids_after,
+        "comment_total_from_progress": progress.get("total"),
+        "comment_expand_button_found": expand_button_found,
+        "comment_expand_candidate_found": expand_candidate_found,
+        "comment_expansion_clicked": expansion_clicked,
+        "comment_expansion_click_failed": expansion_click_failed,
+        "comment_expansion_actions": expansion_actions,
+        "comment_scroll_actions": scroll_actions,
+        "comment_loading_events": loading_events or [],
+        "comment_expansion_stop_reason": stop_reason,
+    }
+
+
+def _extract_comment_from_candidate(candidate: Locator, post_id: str) -> dict[str, str] | None:
+    if _candidate_is_target_post(candidate, post_id):
+        return None
+    text = _safe_inner_text(candidate, preserve_lines=True)
+    if not text:
+        return None
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    author = _extract_comment_author(candidate) or ""
+    content = _extract_comment_message(candidate, author) or _comment_content_from_lines(lines, author)
+    if not content:
+        return None
+    if author and _normalize_match_text(content) == _normalize_match_text(author):
+        return None
+    comment_id = _extract_comment_id(candidate, post_id)
+    return {
+        "comment_content": content,
+        "comment_time": _extract_comment_time(candidate) or "",
+        "comment_author": author,
+        "comment_id": comment_id or "",
+    }
+
+
+def _candidate_is_target_post(candidate: Locator, post_id: str) -> bool:
+    target_links = candidate.locator(f'a[href*="{post_id}"]')
+    for index in range(min(_safe_count(target_links), 5)):
+        href = target_links.nth(index).get_attribute("href") or ""
+        if "comment_id=" not in href and post_id in href:
+            return True
+    return False
+
+
+def _comment_content_from_lines(lines: list[str], author: str = "") -> str | None:
+    ignored = {
+        "like",
+        "reply",
+        "share",
+        "comment",
+        "edited",
+        "top fan",
+        "follow",
+        "see more",
+        "view more replies",
+        "write a reply",
+        "anonymous participant",
+    }
+    normalized_author = " ".join(author.split()).lower()
+    for line in lines:
+        normalized = " ".join(line.split()).lower()
+        if normalized_author and normalized == normalized_author:
+            continue
+        if is_relative_time_text(normalized):
+            continue
+        if normalized in ignored:
+            continue
+        if parse_metric_count(normalized) is not None and len(normalized) <= 8:
+            continue
+        if not _looks_like_comment_content(line):
+            continue
+        return line
+    return None
+
+
+def _extract_comment_message(candidate: Locator, author: str = "") -> str | None:
+    selectors = (
+        '[data-ad-preview="message"]',
+        '[data-ad-comet-preview="message"]',
+        'div[dir="auto"]',
+        'span[dir="auto"]',
+    )
+    normalized_author = _normalize_match_text(author)
+    for selector in selectors:
+        nodes = candidate.locator(selector)
+        for index in range(min(_safe_count(nodes), 20)):
+            node = nodes.nth(index)
+            text = _safe_inner_text(node, preserve_lines=True)
+            if not text:
+                continue
+            normalized = _normalize_match_text(text)
+            if normalized_author and normalized == normalized_author:
+                continue
+            if is_relative_time_text(text):
+                continue
+            if _looks_like_comment_content(text):
+                return text.strip()
+    return None
+
+
+def _looks_like_comment_content(text: str) -> bool:
+    normalized = " ".join(text.split()).lower()
+    if len(normalized) < 2:
+        return False
+    blocked = (
+        "view more comments",
+        "see more comments",
+        "view more replies",
+        "most relevant",
+        "write a comment",
+        "write a reply",
+        "anonymous participant",
+        "follow",
+        "log in",
+        "sign up",
+    )
+    if is_relative_time_text(normalized):
+        return False
+    return not any(phrase in normalized for phrase in blocked)
+
+
+def _extract_comment_time(candidate: Locator) -> str | None:
+    comment_links = candidate.locator('a[href*="comment_id="]')
+    for index in range(min(_safe_count(comment_links), 8)):
+        link = comment_links.nth(index)
+        text = _safe_inner_text(link)
+        if text and is_relative_time_text(text):
+            return text.strip()
+    for selector in ("a[aria-label]", "abbr[title]", "span[aria-label]"):
+        nodes = candidate.locator(selector)
+        for index in range(min(_safe_count(nodes), 8)):
+            node = nodes.nth(index)
+            value = node.get_attribute("aria-label") or node.get_attribute("title") or _safe_inner_text(node)
+            if not value:
+                continue
+            publish_time, publish_time_text = _parse_facebook_publish_time(value)
+            if publish_time or publish_time_text:
+                return publish_time or publish_time_text
+    return None
+
+
+def _extract_comment_author(candidate: Locator) -> str | None:
+    links = candidate.locator('a[role="link"], a[href]')
+    for index in range(min(_safe_count(links), 8)):
+        link = links.nth(index)
+        text = _safe_inner_text(link)
+        href = link.get_attribute("href") or ""
+        if not text or not href:
+            continue
+        normalized = " ".join(text.split())
+        if _invalid_comment_author_text(normalized):
+            continue
+        if "comment_id=" in href or is_relative_time_text(normalized):
+            continue
+        if "facebook.com" in href or href.startswith("/"):
+            return normalized
+    return None
+
+
+def _extract_comment_id(candidate: Locator, post_id: str) -> str | None:
+    links = candidate.locator('a[href*="comment_id="]')
+    for index in range(min(_safe_count(links), 8)):
+        href = links.nth(index).get_attribute("href") or ""
+        if post_id not in href:
+            continue
+        match = re.search(r"[?&]comment_id=([^&#]+)", href)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _invalid_comment_author_text(value: str) -> bool:
+    normalized = " ".join(value.split()).lower()
+    if not normalized:
+        return True
+    if is_relative_time_text(normalized):
+        return True
+    return normalized in {
+        "like",
+        "reply",
+        "share",
+        "comment",
+        "follow",
+        "see more",
+        "edited",
+        "view more replies",
+        "write a reply",
+    }
 
 
 def _extract_dialog_visible_post_content(article: Locator) -> str | None:
@@ -1852,7 +2621,7 @@ def _is_relative_publish_time_text(value: str) -> bool:
     normalized = value.strip().lower()
     return bool(
         re.fullmatch(
-            r"\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)",
+            f"\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)",
             normalized,
         )
         or normalized in {"yesterday", "昨天"}
@@ -1891,16 +2660,19 @@ def _extract_metric_details(container: Locator) -> dict[str, ActionCountExtracti
     metrics = {
         "like": _metric_from_candidates(
             "reaction",
+            action_bar_found=bool(context["action_bar_found"]),
             button_found=bool(context["like_button_found"]),
             candidates=candidates,
         ),
         "comment": _metric_from_candidates(
             "comment",
+            action_bar_found=bool(context["action_bar_found"]),
             button_found=bool(context["comment_button_found"]),
             candidates=candidates,
         ),
         "share": _metric_from_candidates(
             "share",
+            action_bar_found=bool(context["action_bar_found"]),
             button_found=bool(context["share_button_found"]),
             candidates=candidates,
         ),
@@ -1913,12 +2685,13 @@ def _extract_metric_details(container: Locator) -> dict[str, ActionCountExtracti
             count=0,
             source="comment_empty_state",
             rejection_reason=None,
+            count_state="known_zero",
         )
     return metrics
 
 
 def _action_bar_context(container: Locator) -> dict[str, Any]:
-    script = r"""
+    script = """
     (container) => {
       const roleNames = ['like_button', 'comment_button', 'share_button'];
       const markers = Object.fromEntries(
@@ -2131,6 +2904,7 @@ def _metric_summary_candidates(context: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _metric_from_candidates(
     metric_name: str,
+    action_bar_found: bool,
     button_found: bool,
     candidates: list[dict[str, Any]],
 ) -> ActionCountExtraction:
@@ -2150,13 +2924,38 @@ def _metric_from_candidates(
                 count=count,
                 source=str(source),
                 rejection_reason=None,
+                count_state="known_zero" if count == 0 else "known_value",
             )
+    ambiguous_numeric = any(
+        re.search(r"\d", str(candidate.get("text_preview") or ""))
+        and candidate.get("rejection_reason") == "no_semantic_metric_text"
+        for candidate in candidates
+    )
+    if ambiguous_numeric:
+        return ActionCountExtraction(
+            button_found=button_found,
+            raw_text=None,
+            count=None,
+            source=None,
+            rejection_reason="ambiguous_unassigned_numeric_text",
+            count_state="unknown",
+        )
+    if action_bar_found and button_found:
+        return ActionCountExtraction(
+            button_found=button_found,
+            raw_text=None,
+            count=0,
+            source="button_present_no_numeric_summary",
+            rejection_reason=None,
+            count_state="known_zero",
+        )
     return ActionCountExtraction(
         button_found=button_found,
         raw_text=None,
         count=None,
         source=None,
         rejection_reason="button_found_but_no_numeric_summary" if button_found else "button_not_found",
+        count_state="unknown",
     )
 
 
@@ -2446,16 +3245,19 @@ def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any
         "like_button_found": False,
         "like_count_raw": None,
         "like_count": None,
+        "like_count_state": "unknown",
         "like_count_source": None,
         "like_count_rejection_reason": "button_not_found",
         "comment_button_found": False,
         "comment_count_raw": None,
         "comment_count": None,
+        "comment_count_state": "unknown",
         "comment_count_source": None,
         "comment_count_rejection_reason": "button_not_found",
         "share_button_found": False,
         "share_count_raw": None,
         "share_count": None,
+        "share_count_state": "unknown",
         "share_count_source": None,
         "share_count_rejection_reason": "button_not_found",
         "metric_summary_candidates": [],
@@ -2490,16 +3292,19 @@ def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any
         "like_button_found": like.button_found,
         "like_count_raw": like.raw_text,
         "like_count": like.count,
+        "like_count_state": like.count_state,
         "like_count_source": like.source,
         "like_count_rejection_reason": like.rejection_reason,
         "comment_button_found": comment.button_found,
         "comment_count_raw": comment.raw_text,
         "comment_count": comment.count,
+        "comment_count_state": comment.count_state,
         "comment_count_source": comment.source,
         "comment_count_rejection_reason": comment.rejection_reason,
         "share_button_found": share.button_found,
         "share_count_raw": share.raw_text,
         "share_count": share.count,
+        "share_count_state": share.count_state,
         "share_count_source": share.source,
         "share_count_rejection_reason": share.rejection_reason,
         "metric_summary_candidates": summary_candidates,
