@@ -19,6 +19,7 @@ from src.extractors.facebook_post import (
     _extract_comments,
     _extract_metrics,
     _expand_one_comment_button,
+    _comment_empty_state,
     _comment_progress_from_scope,
     _find_comment_expand_button,
     _find_target_article,
@@ -1064,6 +1065,45 @@ class FacebookExtractionResultTests(unittest.TestCase):
         self.assertEqual(result["comment_count"], 5)
         self.assertIsNone(result["share_count"])
 
+    def test_comment_count_unknown_does_not_make_complete_core_post_partial(self) -> None:
+        result = _build_extraction_result(
+            post_id="123",
+            input_url="https://www.facebook.com/openai/posts/123",
+            canonical_url="https://www.facebook.com/openai/posts/123",
+            author={"name": "OpenAI", "profile_url": None},
+            content="Post body",
+            publish_time="2026-06-12T00:00:00Z",
+            publish_time_text=None,
+            like_count=None,
+            comment_count=None,
+            share_count=None,
+            extraction_source="dom",
+            metadata_error=None,
+        )
+
+        self.assertEqual(result["collection_status"], "success")
+        self.assertIsNone(result["comment_count"])
+        self.assertIsNone(result["error"])
+
+    def test_missing_author_is_partial_even_when_comment_count_is_known_zero(self) -> None:
+        result = _build_extraction_result(
+            post_id="123",
+            input_url="https://www.facebook.com/openai/posts/123",
+            canonical_url="https://www.facebook.com/openai/posts/123",
+            author={"name": None, "profile_url": None},
+            content="Post body",
+            publish_time="2026-06-12T00:00:00Z",
+            publish_time_text=None,
+            like_count=None,
+            comment_count=0,
+            share_count=None,
+            extraction_source="dom",
+            metadata_error=None,
+        )
+
+        self.assertEqual(result["collection_status"], "partial")
+        self.assertIn("author", result["error"])
+
 
 class FacebookCommentExpansionTests(unittest.TestCase):
     def _comment_html(self, start: int, end: int, post_id: str = "999") -> str:
@@ -1077,6 +1117,120 @@ class FacebookCommentExpansionTests(unittest.TestCase):
             """
             for index in range(start, end + 1)
         )
+
+    def test_turned_off_commenting_state_short_circuits_loading(self) -> None:
+        html = """
+        <div role="dialog" id="dialog" style="height: 120px; overflow-y: auto;" onscroll="window.scrolled = true">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div>Saramaya Slim turned off commenting for this post.</div>
+          <div role="button" onclick="window.clicked = true">
+            <span><span dir="auto">View more comments</span></span>
+          </div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=3,
+                    no_progress_round_limit=1,
+                )
+                clicked = page.evaluate("window.clicked === true")
+                scrolled = page.evaluate("window.scrolled === true")
+            finally:
+                browser.close()
+
+        self.assertEqual(comments, [])
+        self.assertFalse(clicked)
+        self.assertFalse(scrolled)
+        self.assertTrue(diagnostics["comments_disabled"])
+        self.assertTrue(diagnostics["comment_empty_state_found"])
+        self.assertEqual(diagnostics["comment_empty_state_source"], "turned_off_commenting_text")
+        self.assertEqual(diagnostics["comment_count_state"], "known_zero")
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "comments_disabled")
+        self.assertEqual(diagnostics["comment_expansion_actions"], 0)
+        self.assertEqual(diagnostics["comment_scroll_actions"], 0)
+
+    def test_comment_disabled_matching_ignores_case_and_extra_space(self) -> None:
+        html = """
+        <div id="target">COMMENTS     ARE
+        TURNED     OFF for this post.</div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                state = _comment_empty_state(page.locator("#target"))
+            finally:
+                browser.close()
+
+        self.assertTrue(state["found"])
+        self.assertTrue(state["comments_disabled"])
+        self.assertEqual(state["source"], "turned_off_commenting_text")
+
+    def test_no_comments_yet_state_maps_to_known_zero(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div>No comments yet</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=True,
+                    max_expand_actions=3,
+                    no_progress_round_limit=1,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(comments, [])
+        self.assertFalse(diagnostics["comments_disabled"])
+        self.assertTrue(diagnostics["comment_empty_state_found"])
+        self.assertEqual(diagnostics["comment_empty_state_source"], "no_comments_text")
+        self.assertEqual(diagnostics["comment_count_state"], "known_zero")
+        self.assertEqual(diagnostics["comment_expansion_stop_reason"], "no_comments")
+
+    def test_empty_comments_without_explicit_state_remain_unknown(self) -> None:
+        html = """
+        <div role="dialog" id="dialog">
+          <div id="target"><div data-ad-comet-preview="message">Main post</div></div>
+          <div>Write a comment...</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                comments, diagnostics = _extract_comments(
+                    page.locator("#target"),
+                    "999",
+                    max_comments=20,
+                    expand_comments=False,
+                    max_expand_actions=3,
+                    no_progress_round_limit=1,
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(comments, [])
+        self.assertFalse(diagnostics["comment_empty_state_found"])
+        self.assertEqual(diagnostics["comment_count_state"], "unknown")
 
     def test_scroll_lazy_loads_from_initial_ten_to_twenty_comments(self) -> None:
         initial_comments = self._comment_html(1, 10)
@@ -1820,7 +1974,7 @@ class FacebookActionMetricTests(unittest.TestCase):
                 page.set_content(html)
                 _, comment_count, _ = _extract_metrics(page.locator("#target"))
 
-                self.assertEqual(comment_count, 0)
+                self.assertIsNone(comment_count)
             finally:
                 browser.close()
 
@@ -1903,9 +2057,9 @@ class FacebookActionMetricTests(unittest.TestCase):
 
                 self.assertTrue(details.button_found)
                 self.assertIsNone(details.raw_text)
-                self.assertEqual(details.count, 0)
-                self.assertIsNone(details.rejection_reason)
-                self.assertEqual(details.count_state, "known_zero")
+                self.assertIsNone(details.count)
+                self.assertEqual(details.rejection_reason, "button_found_but_no_numeric_summary")
+                self.assertEqual(details.count_state, "unknown")
             finally:
                 browser.close()
 

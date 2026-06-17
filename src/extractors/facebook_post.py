@@ -1230,8 +1230,11 @@ def _extract_article_data(
     publish_time, publish_time_text = _extract_publish_time(article, post_id)
     like_count, comment_count, share_count = _extract_metrics(article)
     comment_scope = _comment_scope(article)
-    comment_progress = _comment_progress_from_scope(comment_scope)
-    if comment_count is None and isinstance(comment_progress.get("total"), int):
+    comment_state = _comment_state(comment_scope)
+    comment_progress = _comment_progress_from_scope(comment_scope) if not comment_state["found"] else {}
+    if comment_state["found"]:
+        comment_count = 0
+    elif comment_count is None and isinstance(comment_progress.get("total"), int):
         comment_count = int(comment_progress["total"])
     comments, comments_diagnostics = (
         _extract_comments(
@@ -1243,6 +1246,7 @@ def _extract_article_data(
             no_progress_round_limit,
             comment_scope=comment_scope,
             initial_progress=comment_progress,
+            initial_comment_state=comment_state,
         )
         if extract_comments and max_comments > 0
         else ([], {"enabled": False})
@@ -1266,6 +1270,10 @@ def _extract_article_data(
     )
     if extract_comments:
         result["comments_diagnostics"] = comments_diagnostics
+    result["comments_disabled"] = bool(comment_state["comments_disabled"])
+    result["comment_empty_state_found"] = bool(comment_state["found"])
+    result["comment_empty_state_source"] = comment_state["source"]
+    result["comment_count_state"] = "known_zero" if comment_state["found"] else ("known_value" if isinstance(comment_count, int) else "unknown")
     return result
 
 
@@ -1490,10 +1498,32 @@ def _extract_comments(
     no_progress_round_limit: int,
     comment_scope: Locator | None = None,
     initial_progress: dict[str, Any] | None = None,
+    initial_comment_state: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if max_comments <= 0:
         return [], {"enabled": True, "comments_collected_count": 0, "comment_expansion_stop_reason": "max_comments_zero"}
     scope = comment_scope or _comment_scope(article)
+    comment_state = initial_comment_state or _comment_state(scope)
+    if comment_state["found"]:
+        stop_reason = "comments_disabled" if comment_state["comments_disabled"] else "no_comments"
+        return [], _comment_diagnostics(
+            [],
+            0,
+            stop_reason,
+            progress={},
+            comments_visible_before=0,
+            comments_visible_after=0,
+            comment_ids_before=0,
+            comment_ids_after=0,
+            expand_button_found=False,
+            expand_candidate_found=False,
+            expansion_clicked=False,
+            expansion_click_failed=False,
+            loading_mode=None,
+            scroll_actions=0,
+            loading_events=[],
+            comment_state=comment_state,
+        )
     comments: list[dict[str, str]] = []
     seen: set[str] = set()
     expansion_actions = 0
@@ -1642,6 +1672,7 @@ def _extract_comments(
         loading_mode=loading_mode,
         scroll_actions=scroll_actions,
         loading_events=loading_events,
+        comment_state=comment_state,
     )
 
 
@@ -1674,6 +1705,25 @@ def _comment_scope(article: Locator) -> Locator:
     if _safe_count(dialog) > 0:
         return dialog.first
     return article
+
+
+def _comment_state(scope: Locator | None) -> dict[str, Any]:
+    empty = _comment_empty_state(scope)
+    if empty["found"]:
+        return {
+            "found": True,
+            "comments_disabled": bool(empty["comments_disabled"]),
+            "source": empty["source"],
+            "markers": list(empty["markers"]),
+            "comment_count_state": "known_zero",
+        }
+    return {
+        "found": False,
+        "comments_disabled": False,
+        "source": None,
+        "markers": [],
+        "comment_count_state": "unknown",
+    }
 
 
 def _scroll_comment_scope(scope: Locator, post_id: str) -> dict[str, Any]:
@@ -1990,8 +2040,15 @@ def _comment_diagnostics(
     loading_mode: str | None = None,
     scroll_actions: int = 0,
     loading_events: list[dict[str, Any]] | None = None,
+    comment_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     progress = progress or {}
+    comment_state = comment_state or {
+        "found": False,
+        "comments_disabled": False,
+        "source": None,
+        "comment_count_state": "unknown",
+    }
     resolved_loading_mode = loading_mode
     if resolved_loading_mode is None:
         resolved_loading_mode = "button" if expansion_actions > 0 else ("scroll" if scroll_actions > 0 else None)
@@ -2013,6 +2070,12 @@ def _comment_diagnostics(
         "comment_scroll_actions": scroll_actions,
         "comment_loading_events": loading_events or [],
         "comment_expansion_stop_reason": stop_reason,
+        "comments_disabled": bool(comment_state.get("comments_disabled")),
+        "comment_empty_state_found": bool(comment_state.get("found")),
+        "comment_empty_state_source": comment_state.get("source"),
+        "comment_count_state": comment_state.get("comment_count_state") or (
+            "known_zero" if comment_state.get("found") else "unknown"
+        ),
     }
 
 
@@ -2944,10 +3007,10 @@ def _metric_from_candidates(
         return ActionCountExtraction(
             button_found=button_found,
             raw_text=None,
-            count=0,
-            source="button_present_no_numeric_summary",
-            rejection_reason=None,
-            count_state="known_zero",
+            count=None,
+            source=None,
+            rejection_reason="button_found_but_no_numeric_summary",
+            count_state="unknown",
         )
     return ActionCountExtraction(
         button_found=button_found,
@@ -3027,21 +3090,47 @@ def _parse_action_count_text(value: str | None) -> int | None:
 
 
 def _comment_empty_state(container: Locator | None) -> dict[str, Any]:
+    empty = {
+        "found": False,
+        "comments_disabled": False,
+        "source": None,
+        "markers": [],
+    }
     if container is None:
-        return {"found": False, "markers": []}
+        return empty
     try:
         text = container.inner_text(timeout=1_000)
     except PlaywrightError:
-        return {"found": False, "markers": []}
+        return empty
     normalized = " ".join(text.split()).lower()
-    marker_pairs = (
-        ("No comments yet", "Be the first to comment."),
-        ("No comments yet", "Be the first to comment"),
+    disabled_markers = (
+        "turned off commenting for this post",
+        "comments are turned off",
+        "commenting has been turned off",
     )
-    for first, second in marker_pairs:
-        if first.lower() in normalized and second.lower().rstrip(".") in normalized:
-            return {"found": True, "markers": [first, second]}
-    return {"found": False, "markers": []}
+    for marker in disabled_markers:
+        if marker in normalized:
+            return {
+                "found": True,
+                "comments_disabled": True,
+                "source": "turned_off_commenting_text",
+                "markers": [marker],
+            }
+
+    no_comment_markers = (
+        "no comments yet",
+        "be the first to comment",
+        "no comments",
+    )
+    matched_markers = [marker for marker in no_comment_markers if marker in normalized]
+    if matched_markers:
+        return {
+            "found": True,
+            "comments_disabled": False,
+            "source": "no_comments_text",
+            "markers": matched_markers,
+        }
+    return empty
 
 
 def _page_metadata(page: Page) -> dict[str, str]:
@@ -3261,7 +3350,9 @@ def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any
         "share_count_source": None,
         "share_count_rejection_reason": "button_not_found",
         "metric_summary_candidates": [],
+        "comments_disabled": False,
         "comment_empty_state_found": False,
+        "comment_empty_state_source": None,
         "comment_empty_state_markers": [],
     }
     if target_container is None:
@@ -3309,6 +3400,8 @@ def _action_count_diagnostics(target_container: Locator | None) -> dict[str, Any
         "share_count_rejection_reason": share.rejection_reason,
         "metric_summary_candidates": summary_candidates,
         "comment_empty_state_found": bool(empty_state["found"]),
+        "comments_disabled": bool(empty_state["comments_disabled"]),
+        "comment_empty_state_source": empty_state["source"],
         "comment_empty_state_markers": list(empty_state["markers"]),
     }
 

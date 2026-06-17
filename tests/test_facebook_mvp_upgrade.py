@@ -40,6 +40,10 @@ class FacebookFinalSchemaTests(unittest.TestCase):
                         "internal_id": "hidden",
                     }
                 ],
+                "comments_disabled": True,
+                "comment_empty_state_found": True,
+                "comment_empty_state_source": "turned_off_commenting_text",
+                "comment_count_state": "known_zero",
                 "collected_at": "2026-06-16T08:00:00Z",
                 "diagnostics": {"hidden": True},
             }
@@ -55,6 +59,8 @@ class FacebookFinalSchemaTests(unittest.TestCase):
         )
         self.assertNotIn("post_id", final)
         self.assertNotIn("diagnostics", final)
+        self.assertNotIn("comments_disabled", final)
+        self.assertNotIn("comment_count_state", final)
 
     def test_export_writes_jsonl_and_excel_friendly_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

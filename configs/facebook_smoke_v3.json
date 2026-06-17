@@ -1,0 +1,43 @@
+{
+  "job_name": "facebook-smoke-v3",
+  "platform": "facebook",
+  "keywords": [
+    "Indie game",
+    "Roguelike"
+  ],
+  "search": {
+    "max_results_per_keyword": 15,
+    "page_size": 10
+  },
+  "facebook": {
+    "storage_state": ".playwright/facebook_storage_state.json",
+    "headless": true,
+    "delay_seconds": 2,
+    "save_debug_bundle": true
+  },
+  "comments": {
+    "enabled": true,
+    "max_comments_per_post": 25,
+    "expand_comments": true,
+    "max_expand_actions": 10,
+    "no_progress_round_limit": 3
+  },
+  "retry": {
+    "max_attempts": 1,
+    "retry_delay_seconds": 3
+  },
+  "history": {
+    "enabled": false,
+    "index_path": "output/history/facebook_posts.jsonl",
+    "skip_statuses": [
+      "success",
+      "partial"
+    ],
+    "retry_failed": true
+  },
+  "output": {
+    "root_dir": "output/runs",
+    "export_csv": true,
+    "generate_report": true
+  }
+}
