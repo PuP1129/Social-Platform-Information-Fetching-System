@@ -61,6 +61,27 @@ X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控
 - `output/x_post.json`
 - `output/debug/x_post_failure.*`
 
+## X 批量采集
+
+输入 JSON 可以是 URL 字符串数组，或包含 `url` 字段的对象数组。运行：
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --x-batch-file "x_urls.json" `
+  --x-storage-state ".playwright/x_storage_state.json" `
+  --x-batch-output "output/x_posts.jsonl" `
+  --x-batch-delay 2
+```
+
+常用选项：
+
+- `--x-batch-limit 10`
+- `--x-batch-resume`
+- `--normalize-output`
+- `--headless`
+
+默认每行保存现有 X extractor 原始结果；使用 `--normalize-output` 时，每行保存统一的 `social_post_v1` 结果。单条失败会写入 `collection_status: "failed"` 的记录，并继续处理后续 URL。当前不采集评论、线程、引用帖详情或媒体文件。
+
 ## Facebook 单帖采集
 
 ```powershell

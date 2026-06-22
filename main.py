@@ -10,6 +10,7 @@ from src.utils.social_post_normalizer import normalize_social_post
 RAW_OUTPUT_PATH = Path("output") / "search_results.json"
 POST_OUTPUT_PATH = Path("output") / "post_urls.json"
 X_POST_OUTPUT_PATH = Path("output") / "x_post.json"
+X_BATCH_OUTPUT_PATH = Path("output") / "x_posts.jsonl"
 FACEBOOK_POST_OUTPUT_PATH = Path("output") / "facebook_post.json"
 FACEBOOK_BATCH_OUTPUT_PATH = Path("output") / "facebook_posts.jsonl"
 
@@ -19,6 +20,7 @@ def parse_args() -> argparse.Namespace:
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument("--keyword", help="Single keyword to search.")
     input_group.add_argument("--x-url", help="Single X post URL to extract.")
+    input_group.add_argument("--x-batch-file", type=Path, help="JSON file containing X post URLs to extract.")
     input_group.add_argument("--facebook-url", help="Single public Facebook post URL to extract.")
     input_group.add_argument("--facebook-batch-file", type=Path, help="JSON file containing Facebook post URLs to extract.")
     input_group.add_argument(
@@ -76,6 +78,29 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Path to a local Playwright storage-state JSON file for authenticated X access.",
+    )
+    parser.add_argument(
+        "--x-batch-output",
+        type=Path,
+        default=X_BATCH_OUTPUT_PATH,
+        help="JSONL output path for X batch extraction.",
+    )
+    parser.add_argument(
+        "--x-batch-limit",
+        type=int,
+        default=None,
+        help="Optional maximum number of unique supported X posts to process.",
+    )
+    parser.add_argument(
+        "--x-batch-delay",
+        type=float,
+        default=2.0,
+        help="Delay in seconds between X batch items.",
+    )
+    parser.add_argument(
+        "--x-batch-resume",
+        action="store_true",
+        help="Append to an existing X batch JSONL and skip already processed posts.",
     )
     parser.add_argument(
         "--facebook-storage-state",
@@ -146,6 +171,17 @@ def main() -> None:
             args.x_url.strip(),
             args.headless,
             args.x_storage_state,
+            normalize_output=args.normalize_output,
+        )
+    elif args.x_batch_file:
+        run_x_batch_extraction(
+            input_path=args.x_batch_file,
+            output_path=args.x_batch_output,
+            limit=args.x_batch_limit,
+            delay_seconds=args.x_batch_delay,
+            resume=args.x_batch_resume,
+            headless=args.headless,
+            storage_state_path=args.x_storage_state,
             normalize_output=args.normalize_output,
         )
     elif args.facebook_url:
@@ -269,6 +305,47 @@ def run_x_post_extraction(
     else:
         print("X post extracted with partial data.")
     print(f"JSON written to {X_POST_OUTPUT_PATH}")
+
+
+def run_x_batch_extraction(
+    input_path: Path,
+    output_path: Path,
+    limit: int | None,
+    delay_seconds: float,
+    resume: bool,
+    headless: bool,
+    storage_state_path: Path | None,
+    normalize_output: bool = False,
+) -> None:
+    from src.batch.x_batch import run_x_batch
+
+    if limit is not None and limit < 1:
+        raise SystemExit("--x-batch-limit must be greater than 0.")
+    if delay_seconds < 0:
+        raise SystemExit("--x-batch-delay must be 0 or greater.")
+
+    print(f"Extracting X posts from: {input_path}")
+    try:
+        summary = run_x_batch(
+            input_path=input_path,
+            storage_state_path=storage_state_path,
+            output_path=output_path,
+            limit=limit,
+            delay_seconds=delay_seconds,
+            headless=headless,
+            resume=resume,
+            record_transform=normalize_social_post if normalize_output else None,
+        )
+    except (ValueError, OSError, RuntimeError) as exc:
+        raise SystemExit(f"X batch extraction failed: {exc}") from exc
+
+    print(
+        "X batch finished: "
+        f"{summary['success_count']} success, "
+        f"{summary['failed_count']} failed, "
+        f"{summary['skipped_count']} skipped."
+    )
+    print(f"JSONL written to {output_path}")
 
 
 def run_facebook_post_extraction(
