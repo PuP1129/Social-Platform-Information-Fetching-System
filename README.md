@@ -152,6 +152,20 @@ output/runs/<job_name>/<run_id>/
 
 `--facebook-ignore-history` 可在配置模式下临时关闭跨运行历史去重。配置中只保存 storage-state 路径，不保存 Cookie、账号密码或 storage-state 内容。
 
+## Raw 与标准化输出
+
+默认情况下，单帖和批量命令继续写入各平台原始结果字段，以保持向后兼容。
+
+在单个 X 帖子、单个 Facebook 帖子、Facebook 直接批量或 Facebook 搜索批量命令中增加：
+
+```text
+--normalize-output
+```
+
+即可改为写入统一的 `social_post_v1`（`schema_version: "1.0"`）结构。该结构统一作者、正文、发布时间和互动量字段；X 的 `reply_count` 映射为顶层 `comment_count`，并仅在 `platform_metrics.reply_count` 中保留旧字段语义。
+
+当下游需要同时消费 X 与 Facebook 数据时使用标准化输出；依赖现有平台字段或诊断字段时继续使用默认 raw 输出。配置驱动的 Facebook job/export 仍使用其现有固定导出 schema，不受该选项影响。
+
 ### Internal Result 与 Final Result
 
 `internal_results.jsonl` 保留工程字段，例如 URL、post_id、状态、错误、debug 路径和输入 metadata。

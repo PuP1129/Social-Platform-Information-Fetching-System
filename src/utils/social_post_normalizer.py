@@ -64,7 +64,7 @@ def normalize_social_post(record: Mapping[str, Any]) -> dict[str, Any]:
         "comments": _normalize_comments(record.get("comments")),
         "collected_at": _optional_string(record.get("collected_at")),
         "collection_status": _optional_string(record.get("collection_status")),
-        "error": _optional_string(record.get("error")),
+        "error": _normalize_error(record.get("error")),
         "platform_metrics": _platform_metrics(record, platform, comment_count),
     }
 
@@ -121,6 +121,16 @@ def _optional_string(value: Any) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+def _normalize_error(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        error_type = _optional_string(value.get("type"))
+        message = _optional_string(value.get("message"))
+        if error_type and message:
+            return f"{error_type}: {message}"
+        return message or error_type
+    return _optional_string(value)
 
 
 def _count_or_none(value: Any) -> int | None:

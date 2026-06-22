@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import main
+from src.batch.facebook_batch import run_facebook_batch
 from src.utils.social_post_normalizer import (
     NORMALIZED_SOCIAL_POST_FIELDS,
     SocialPostNormalizationError,
@@ -112,6 +118,139 @@ class SocialPostNormalizationTests(unittest.TestCase):
     def test_rejects_unsupported_platform(self) -> None:
         with self.assertRaisesRegex(SocialPostNormalizationError, "x.*facebook"):
             normalize_social_post({"platform": "reddit"})
+
+
+class NormalizedOutputBoundaryTests(unittest.TestCase):
+    def test_normalize_output_cli_flag_is_recognized(self) -> None:
+        with patch(
+            "sys.argv",
+            ["main.py", "--x-url", "https://x.com/OpenAI/status/123", "--normalize-output"],
+        ):
+            args = main.parse_args()
+
+        self.assertTrue(args.normalize_output)
+
+    def test_x_single_output_is_normalized_when_requested(self) -> None:
+        raw = _x_record()
+        raw["unknown_field"] = "not-normalized"
+        with patch("src.extractors.x_post.extract_x_post", return_value=raw):
+            with patch("main.write_output") as write_output:
+                main.run_x_post_extraction(
+                    raw["canonical_url"],
+                    headless=True,
+                    normalize_output=True,
+                )
+
+        written = write_output.call_args.args[0]
+        self.assertEqual(written["schema_version"], "1.0")
+        self.assertEqual(written["comment_count"], 12)
+        self.assertNotIn("reply_count", written)
+        self.assertEqual(written["platform_metrics"], {"reply_count": 12})
+        self.assertNotIn("unknown_field", written)
+
+    def test_facebook_single_output_is_normalized_when_requested(self) -> None:
+        raw = _facebook_record()
+        with patch("src.extractors.facebook_post.extract_facebook_post", return_value=raw):
+            with patch("main.write_output") as write_output:
+                main.run_facebook_post_extraction(
+                    raw["canonical_url"],
+                    headless=True,
+                    normalize_output=True,
+                )
+
+        written = write_output.call_args.args[0]
+        self.assertEqual(written["schema_version"], "1.0")
+        self.assertEqual(written["comment_count"], 3)
+        self.assertIsNone(written["repost_count"])
+        self.assertIsNone(written["author"]["handle"])
+
+    def test_default_single_output_remains_raw(self) -> None:
+        raw = _x_record()
+        raw["unknown_field"] = "preserved"
+        with patch("src.extractors.x_post.extract_x_post", return_value=raw):
+            with patch("main.write_output") as write_output:
+                main.run_x_post_extraction(raw["canonical_url"], headless=True)
+
+        self.assertIs(write_output.call_args.args[0], raw)
+        self.assertEqual(write_output.call_args.args[0]["unknown_field"], "preserved")
+
+    def test_normalized_facebook_batch_writes_only_normalized_records(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_path = root / "input.json"
+            output_path = root / "results.jsonl"
+            summary_path = root / "summary.json"
+            state_path = root / "state.json"
+            url = "https://www.facebook.com/example/posts/456"
+            input_path.write_text(json.dumps([url]), encoding="utf-8")
+            state_path.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
+
+            raw = _facebook_record()
+            raw.update(
+                {
+                    "cookies": [{"value": "secret-cookie"}],
+                    "storage_state": {"token": "secret-state"},
+                    "unknown_field": "not-normalized",
+                }
+            )
+            run_facebook_batch(
+                input_path=input_path,
+                storage_state_path=state_path,
+                output_path=output_path,
+                summary_path=summary_path,
+                diagnostics_dir=root / "debug",
+                extractor=lambda _context, _url: raw,
+                sleep_fn=lambda _seconds: None,
+                record_transform=normalize_social_post,
+            )
+
+            written = json.loads(output_path.read_text(encoding="utf-8").strip())
+
+        self.assertEqual(written["schema_version"], "1.0")
+        self.assertNotIn("cookies", written)
+        self.assertNotIn("storage_state", written)
+        self.assertNotIn("unknown_field", written)
+
+
+def _x_record() -> dict[str, object]:
+    return {
+        "platform": "x",
+        "post_id": "123",
+        "input_url": "https://x.com/OpenAI/status/123",
+        "canonical_url": "https://x.com/OpenAI/status/123",
+        "author": {"name": "OpenAI", "handle": "@OpenAI"},
+        "content": "Example X post",
+        "publish_time": "2026-06-22T00:00:00Z",
+        "reply_count": 12,
+        "comment_count": 12,
+        "repost_count": 34,
+        "like_count": 56,
+        "view_count": 789,
+        "share_count": None,
+        "comments": [],
+        "collected_at": "2026-06-22T01:00:00Z",
+        "collection_status": "success",
+        "error": None,
+    }
+
+
+def _facebook_record() -> dict[str, object]:
+    return {
+        "platform": "facebook",
+        "post_id": "456",
+        "input_url": "https://www.facebook.com/example/posts/456",
+        "canonical_url": "https://www.facebook.com/example/posts/456",
+        "author": {"name": "Example Page", "profile_url": "https://www.facebook.com/example"},
+        "content": "Example Facebook post",
+        "publish_time": "2026-06-22T00:00:00Z",
+        "comment_count": 3,
+        "like_count": 10,
+        "share_count": 2,
+        "comments": [],
+        "collected_at": "2026-06-22T01:00:00Z",
+        "collection_status": "success",
+        "error": None,
+    }
 
 
 if __name__ == "__main__":

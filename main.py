@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from src.filters.post_url import filter_post_results
+from src.utils.social_post_normalizer import normalize_social_post
 
 RAW_OUTPUT_PATH = Path("output") / "search_results.json"
 POST_OUTPUT_PATH = Path("output") / "post_urls.json"
@@ -92,6 +93,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore cross-run Facebook history when using --facebook-job-config.",
     )
+    parser.add_argument(
+        "--normalize-output",
+        action="store_true",
+        help="Write the shared social_post_v1 schema for supported single-post and batch outputs.",
+    )
     return parser.parse_args()
 
 
@@ -136,13 +142,19 @@ def main() -> None:
     if args.keyword:
         run_search(args.keyword.strip(), args.headless, args.max_results)
     elif args.x_url:
-        run_x_post_extraction(args.x_url.strip(), args.headless, args.x_storage_state)
+        run_x_post_extraction(
+            args.x_url.strip(),
+            args.headless,
+            args.x_storage_state,
+            normalize_output=args.normalize_output,
+        )
     elif args.facebook_url:
         run_facebook_post_extraction(
             args.facebook_url.strip(),
             args.headless,
             args.facebook_storage_state,
             args.facebook_save_debug_bundle,
+            normalize_output=args.normalize_output,
         )
     elif args.facebook_batch_file:
         run_facebook_batch_extraction(
@@ -154,6 +166,7 @@ def main() -> None:
             headless=args.headless,
             storage_state_path=args.facebook_storage_state,
             save_debug_bundle=args.facebook_save_debug_bundle,
+            normalize_output=args.normalize_output,
         )
     elif args.facebook_job_config:
         run_facebook_job_config_mode(
@@ -180,6 +193,7 @@ def main() -> None:
             headless=args.headless,
             storage_state_path=args.facebook_storage_state,
             save_debug_bundle=args.facebook_save_debug_bundle,
+            normalize_output=args.normalize_output,
         )
 
 
@@ -227,7 +241,12 @@ def run_search(keyword: str, headless: bool, max_results: int) -> None:
     print(f"Post URL JSON written to {POST_OUTPUT_PATH}")
 
 
-def run_x_post_extraction(url: str, headless: bool, storage_state_path: Path | None = None) -> None:
+def run_x_post_extraction(
+    url: str,
+    headless: bool,
+    storage_state_path: Path | None = None,
+    normalize_output: bool = False,
+) -> None:
     try:
         from src.extractors.x_post import XPostExtractionError, extract_x_post
     except ModuleNotFoundError as exc:
@@ -243,7 +262,8 @@ def run_x_post_extraction(url: str, headless: bool, storage_state_path: Path | N
     except (ValueError, XPostExtractionError) as exc:
         raise SystemExit(f"X post extraction failed: {exc}") from exc
 
-    write_output(payload, X_POST_OUTPUT_PATH)
+    output_payload = normalize_social_post(payload) if normalize_output else payload
+    write_output(output_payload, X_POST_OUTPUT_PATH)
     if payload["collection_status"] == "success":
         print("X post extracted successfully.")
     else:
@@ -256,6 +276,7 @@ def run_facebook_post_extraction(
     headless: bool,
     storage_state_path: Path | None = None,
     save_debug_bundle: bool = False,
+    normalize_output: bool = False,
 ) -> None:
     try:
         from src.extractors.facebook_post import FacebookPostExtractionError, extract_facebook_post
@@ -273,7 +294,8 @@ def run_facebook_post_extraction(
     except (ValueError, FacebookPostExtractionError) as exc:
         raise SystemExit(f"Facebook post extraction failed: {exc}") from exc
 
-    write_output(payload, FACEBOOK_POST_OUTPUT_PATH)
+    output_payload = normalize_social_post(payload) if normalize_output else payload
+    write_output(output_payload, FACEBOOK_POST_OUTPUT_PATH)
     if payload["collection_status"] == "success":
         print("Facebook post extracted successfully.")
     else:
@@ -290,6 +312,7 @@ def run_facebook_batch_extraction(
     headless: bool,
     storage_state_path: Path | None,
     save_debug_bundle: bool = False,
+    normalize_output: bool = False,
 ) -> None:
     try:
         from src.batch.facebook_batch import DEFAULT_BATCH_SUMMARY_PATH, run_facebook_batch
@@ -313,6 +336,7 @@ def run_facebook_batch_extraction(
             headless=headless,
             resume=resume,
             save_debug_bundle=save_debug_bundle,
+            record_transform=normalize_social_post if normalize_output else None,
         )
     except (ValueError, OSError, RuntimeError) as exc:
         raise SystemExit(f"Facebook batch extraction failed: {exc}") from exc
@@ -338,6 +362,7 @@ def run_facebook_search_collection(
     headless: bool,
     storage_state_path: Path | None,
     save_debug_bundle: bool = False,
+    normalize_output: bool = False,
 ) -> None:
     try:
         from src.pipelines.facebook_search_pipeline import (
@@ -360,6 +385,7 @@ def run_facebook_search_collection(
                 headless=headless,
                 resume=resume,
                 save_debug_bundle=save_debug_bundle,
+                record_transform=normalize_social_post if normalize_output else None,
             )
         except (ValueError, OSError, RuntimeError) as exc:
             raise SystemExit(f"Facebook search manifest collection failed: {exc}") from exc
@@ -382,6 +408,7 @@ def run_facebook_search_collection(
             headless=headless,
             resume=resume,
             save_debug_bundle=save_debug_bundle,
+            record_transform=normalize_social_post if normalize_output else None,
         )
     except (ValueError, OSError, RuntimeError, GooglePSESearchError) as exc:
         raise SystemExit(f"Facebook search collection failed: {exc}") from exc

@@ -30,6 +30,7 @@ def run_facebook_search_pipeline(
     artifact_dir: Path = DEFAULT_FACEBOOK_SEARCH_DIR,
     search_fn: SearchFn = search_google_pse_with_metadata,
     batch_fn: BatchFn = run_facebook_batch,
+    record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Backward-compatible single-keyword wrapper."""
     return run_facebook_multi_search_pipeline(
@@ -44,6 +45,7 @@ def run_facebook_search_pipeline(
         artifact_dir=artifact_dir,
         search_fn=search_fn,
         batch_fn=batch_fn,
+        record_transform=record_transform,
     )
 
 
@@ -60,6 +62,7 @@ def run_facebook_multi_search_pipeline(
     manifest_path: Path | None = None,
     search_fn: SearchFn = search_google_pse_with_metadata,
     batch_fn: BatchFn = run_facebook_batch,
+    record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Search multiple keywords, globally deduplicate Facebook posts, then run batch."""
     normalized_keywords = normalize_keywords(keywords)
@@ -166,6 +169,7 @@ def run_facebook_multi_search_pipeline(
         resume=resume,
         save_debug_bundle=save_debug_bundle,
         batch_fn=batch_fn,
+        record_transform=record_transform,
     )
 
     summary = _build_pipeline_summary(
@@ -198,6 +202,7 @@ def run_facebook_search_manifest_pipeline(
     save_debug_bundle: bool = False,
     artifact_dir: Path = DEFAULT_FACEBOOK_SEARCH_DIR,
     batch_fn: BatchFn = run_facebook_batch,
+    record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run Facebook batch directly from a saved search manifest without Google PSE."""
     _validate_pipeline_args(1, delay_seconds)
@@ -218,6 +223,7 @@ def run_facebook_search_manifest_pipeline(
         resume=resume,
         save_debug_bundle=save_debug_bundle,
         batch_fn=batch_fn,
+        record_transform=record_transform,
     )
     per_keyword = [
         {
@@ -458,20 +464,24 @@ def _run_batch_if_needed(
     resume: bool,
     save_debug_bundle: bool,
     batch_fn: BatchFn,
+    record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None,
 ) -> dict[str, Any] | None:
     if not items:
         return None
-    return batch_fn(
-        input_path=batch_input_path,
-        storage_state_path=storage_state_path,
-        output_path=output_path,
-        summary_path=artifact_dir / "batch_summary.json",
-        diagnostics_dir=DEFAULT_BATCH_DIAGNOSTICS_DIR,
-        delay_seconds=delay_seconds,
-        headless=headless,
-        resume=resume,
-        save_debug_bundle=save_debug_bundle,
-    )
+    batch_kwargs = {
+        "input_path": batch_input_path,
+        "storage_state_path": storage_state_path,
+        "output_path": output_path,
+        "summary_path": artifact_dir / "batch_summary.json",
+        "diagnostics_dir": DEFAULT_BATCH_DIAGNOSTICS_DIR,
+        "delay_seconds": delay_seconds,
+        "headless": headless,
+        "resume": resume,
+        "save_debug_bundle": save_debug_bundle,
+    }
+    if record_transform is not None:
+        batch_kwargs["record_transform"] = record_transform
+    return batch_fn(**batch_kwargs)
 
 
 def _build_pipeline_summary(

@@ -82,6 +82,7 @@ def run_facebook_batch(
     no_progress_round_limit: int = 3,
     max_attempts: int = 2,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Collect Facebook posts sequentially into JSONL."""
     if max_attempts < 1:
@@ -118,8 +119,9 @@ def run_facebook_batch(
         for index, item in enumerate(items, start=1):
             if item.skip_reason is not None:
                 record = _skipped_record(item, item.skip_reason)
-                _append_jsonl_record(active_output_path, record)
-                current_records.append(record)
+                output_record = _transform_output_record(record, record_transform)
+                _append_jsonl_record(active_output_path, output_record)
+                current_records.append(output_record)
                 skipped_this_run += 1
                 failure_types[item.skip_reason] += 1
                 continue
@@ -132,8 +134,9 @@ def run_facebook_batch(
 
             if login_wall_streak >= LOGIN_WALL_STOP_THRESHOLD:
                 record = _skipped_record(item, "batch_stopped_due_to_login_wall")
-                _append_jsonl_record(active_output_path, record)
-                current_records.append(record)
+                output_record = _transform_output_record(record, record_transform)
+                _append_jsonl_record(active_output_path, output_record)
+                current_records.append(output_record)
                 skipped_this_run += 1
                 failure_types["batch_stopped_due_to_login_wall"] += 1
                 continue
@@ -156,8 +159,9 @@ def run_facebook_batch(
                 no_progress_round_limit=no_progress_round_limit,
                 max_attempts=max_attempts,
             )
-            _append_jsonl_record(active_output_path, record)
-            current_records.append(record)
+            output_record = _transform_output_record(record, record_transform)
+            _append_jsonl_record(active_output_path, output_record)
+            current_records.append(output_record)
             processed_this_run += 1
             processed_urls.add(resume_key)
 
@@ -570,6 +574,13 @@ def _read_jsonl_records(output_path: Path) -> list[dict[str, Any]]:
 def _append_jsonl_record(output_path: Path, record: dict[str, Any]) -> None:
     with output_path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _transform_output_record(
+    record: dict[str, Any],
+    transform: Callable[[dict[str, Any]], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    return transform(record) if transform is not None else record
 
 
 def _temporary_batch_output_path(output_path: Path) -> Path:
