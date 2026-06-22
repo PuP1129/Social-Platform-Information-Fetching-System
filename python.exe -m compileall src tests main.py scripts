@@ -1,0 +1,121 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/.gitignore b/.gitignore[m
+[1mindex 76a4227..9aeb553 100644[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@ -212,7 +212,7 @@[m [mcython_debug/[m
+ #   be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore[m
+ #   and can be added to the global gitignore or merged into this file.  For a more nuclear[m
+ #   option (not recommended) you can uncomment the following to ignore the entire idea folder.[m
+[31m-# .idea/[m
+[32m+[m[32m.idea/[m
+ [m
+ # Abstra[m
+ #   Abstra is an AI-powered process automation framework.[m
+[1mdiff --git a/AGENTS.md b/AGENTS.md[m
+[1mindex 19a8057..b56bb6a 100644[m
+[1m--- a/AGENTS.md[m
+[1m+++ b/AGENTS.md[m
+[36m@@ -11,4 +11,5 @@[m [mExamples:[m
+ ```powershell[m
+ .\.venv\Scripts\python.exe -m compileall src tests main.py[m
+ .\.venv\Scripts\python.exe -m unittest discover -s tests -v[m
+[31m-.\.venv\Scripts\python.exe main.py --help[m
+\ No newline at end of file[m
+[32m+[m[32m.\.venv\Scripts\python.exe main.py --help[m
+[32m+[m[32m```[m
+[1mdiff --git a/examples/facebook_group_3_urls.example.json b/examples/facebook_group_3_urls.example.json[m
+[1mdeleted file mode 100644[m
+[1mindex c69ccde..0000000[m
+[1m--- a/examples/facebook_group_3_urls.example.json[m
+[1m+++ /dev/null[m
+[36m@@ -1,7 +0,0 @@[m
+[31m-{[m
+[31m-  "posts": [[m
+[31m-    {"canonical_url": "https://www.facebook.com/groups/mybookloversclub/posts/8702397713162461"},[m
+[31m-    {"canonical_url": "https://www.facebook.com/groups/mybookloversclub/posts/7309667872435459"},[m
+[31m-    {"canonical_url": "https://www.facebook.com/groups/TwoGirlsMustReads/posts/1805183203614163"}[m
+[31m-  ][m
+[31m-}[m
+\ No newline at end of file[m
+[1mdiff --git a/scripts/save_facebook_state.py b/scripts/save_facebook_state.py[m
+[1mdeleted file mode 100644[m
+[1mindex e8db907..0000000[m
+[1m--- a/scripts/save_facebook_state.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,24 +0,0 @@[m
+[31m-﻿from pathlib import Path[m
+[31m-from playwright.sync_api import sync_playwright[m
+[31m-[m
+[31m-STATE_PATH = Path(".playwright/facebook_storage_state.json")[m
+[31m-STATE_PATH.parent.mkdir(parents=True, exist_ok=True)[m
+[31m-[m
+[31m-with sync_playwright() as p:[m
+[31m-    browser = p.chromium.launch(headless=False)[m
+[31m-    context = browser.new_context()[m
+[31m-    page = context.new_page()[m
+[31m-[m
+[31m-    page.goto([m
+[31m-        "https://www.facebook.com/",[m
+[31m-        wait_until="domcontentloaded",[m
+[31m-        timeout=60000,[m
+[31m-    )[m
+[31m-[m
+[31m-    print("Log in to Facebook in the opened browser.")[m
+[31m-    input("After login is complete, return here and press Enter to save: ")[m
+[31m-[m
+[31m-    context.storage_state(path=str(STATE_PATH))[m
+[31m-    print(f"Saved storage state to: {STATE_PATH}")[m
+[31m-[m
+[31m-    browser.close()[m
+[1mdiff --git a/scripts/verify_facebook_state.py b/scripts/verify_facebook_state.py[m
+[1mdeleted file mode 100644[m
+[1mindex 4fd34e6..0000000[m
+[1m--- a/scripts/verify_facebook_state.py[m
+[1m+++ /dev/null[m
+[36m@@ -1,24 +0,0 @@[m
+[31m-﻿from playwright.sync_api import sync_playwright[m
+[31m-[m
+[31m-POST_URL = "https://www.facebook.com/groups/454270309188726/posts/1375712860377795"[m
+[31m-[m
+[31m-with sync_playwright() as p:[m
+[31m-    browser = p.chromium.launch(headless=False)[m
+[31m-[m
+[31m-    context = browser.new_context([m
+[31m-        storage_state=".playwright/facebook_storage_state.json"[m
+[31m-    )[m
+[31m-[m
+[31m-    page = context.new_page()[m
+[31m-    page.goto([m
+[31m-        POST_URL,[m
+[31m-        wait_until="domcontentloaded",[m
+[31m-        timeout=60000,[m
+[31m-    )[m
+[31m-[m
+[31m-    print("Current URL:", page.url)[m
+[31m-    print("Login input count:", page.locator('input[name="email"]').count())[m
+[31m-    print("Browser stays open for 120 seconds.")[m
+[31m-[m
+[31m-    page.wait_for_timeout(120000)[m
+[31m-    browser.close()[m
+[1mdiff --git a/tests/fixtures/facebook/.gitkeep b/tests/fixtures/facebook/.gitkeep[m
+[1mdeleted file mode 100644[m
+[1mindex 8b13789..0000000[m
+[1m--- a/tests/fixtures/facebook/.gitkeep[m
+[1m+++ /dev/null[m
+[36m@@ -1 +0,0 @@[m
+[31m-[m
+[1mdiff --git a/tests/fixtures/manifests/.gitkeep b/tests/fixtures/manifests/.gitkeep[m
+[1mdeleted file mode 100644[m
+[1mindex 8b13789..0000000[m
+[1m--- a/tests/fixtures/manifests/.gitkeep[m
+[1m+++ /dev/null[m
+[36m@@ -1 +0,0 @@[m
+[31m-[m
+[1mdiff --git a/tests/fixtures/search/.gitkeep b/tests/fixtures/search/.gitkeep[m
+[1mdeleted file mode 100644[m
+[1mindex 8b13789..0000000[m
+[1m--- a/tests/fixtures/search/.gitkeep[m
+[1m+++ /dev/null[m
+[36m@@ -1 +0,0 @@[m
+[31m-[m

@@ -12,3 +12,4 @@ Examples:
 .\.venv\Scripts\python.exe -m compileall src tests main.py
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 .\.venv\Scripts\python.exe main.py --help
+```
