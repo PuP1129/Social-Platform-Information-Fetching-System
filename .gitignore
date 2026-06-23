@@ -38,6 +38,7 @@ playwright/.auth/
 facebook_storage_state.json
 storage_state.json
 cookies.json
+configs/*.local.json
 
 # Runtime output
 output/*

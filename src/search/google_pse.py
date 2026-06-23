@@ -8,7 +8,7 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 GOOGLE_PSE_URL = "https://cse.google.com/cse?cx=e26d7e4e0bc774ea6"
-DEFAULT_TIMEOUT_MS = 15_000
+DEFAULT_TIMEOUT_MS = 45_000
 GOOGLE_PSE_PAGE_SIZE = 10
 GOOGLE_PSE_MAX_RESULTS = 100
 

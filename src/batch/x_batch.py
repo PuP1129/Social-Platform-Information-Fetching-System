@@ -185,6 +185,8 @@ def _read_processed_identities(output_path: Path) -> set[tuple[str, str]]:
 
 def _record_identities(record: dict[str, Any]) -> set[tuple[str, str]]:
     identities: set[tuple[str, str]] = set()
+    if record.get("platform") not in {None, "x"}:
+        return identities
     for field in ("input_url", "canonical_url", "post_id"):
         value = record.get(field)
         if isinstance(value, str) and value:

@@ -16,6 +16,7 @@ from src.extractors.facebook_post import (
     _extract_action_count_details,
     _extract_article_data,
     _extract_author,
+    _extract_post_source,
     _extract_comments,
     _extract_metrics,
     _expand_one_comment_button,
@@ -35,6 +36,7 @@ from src.extractors.facebook_post import (
     _semantic_score,
     _target_post_link_selector,
     _normalize_facebook_profile_url,
+    _author_name_from_post_label,
     _visible_publish_time_candidates,
     extract_facebook_post,
 )
@@ -1014,6 +1016,120 @@ class FacebookExtractionResultTests(unittest.TestCase):
         )
 
         self.assertEqual(result["context_type"], "group")
+
+    def test_group_source_author_can_make_group_post_success_without_publish_time(self) -> None:
+        result = _build_extraction_result(
+            post_id="123",
+            input_url="https://www.facebook.com/groups/booklovers/posts/123",
+            canonical_url="https://www.facebook.com/groups/booklovers/posts/123",
+            author={
+                "name": "Book Lovers",
+                "profile_url": "https://www.facebook.com/groups/booklovers",
+                "type": "group",
+            },
+            content="Post body",
+            publish_time=None,
+            publish_time_text=None,
+            like_count=None,
+            comment_count=None,
+            share_count=None,
+            extraction_source="dom",
+            metadata_error=None,
+            context_type="group",
+            source={
+                "type": "group",
+                "name": "Book Lovers",
+                "profile_url": "https://www.facebook.com/groups/booklovers",
+            },
+        )
+
+        self.assertEqual(result["collection_status"], "success")
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["author"]["type"], "group")
+        self.assertEqual(result["source"]["type"], "group")
+
+    def test_group_source_is_extracted_from_visible_group_link(self) -> None:
+        html = """
+        <div id="target">
+          <a href="/groups/booklovers/">Book Lovers</a>
+          <a href="/groups/booklovers/posts/123">Post permalink</a>
+          <a href="/groups/booklovers/user/456">Member Name</a>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                source = _extract_post_source(
+                    page.locator("#target"),
+                    "https://www.facebook.com/groups/booklovers/posts/123",
+                    "group",
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(
+            source,
+            {
+                "type": "group",
+                "name": "Book Lovers",
+                "profile_url": "https://www.facebook.com/groups/booklovers",
+            },
+        )
+
+    def test_group_post_with_user_author_keeps_user_author_and_source(self) -> None:
+        html = """
+        <div id="target">
+          <a href="/groups/kansascitysecrets/">Kansas City Secrets</a>
+          <a href="/groups/kansascitysecrets/user/456">Raymond Baumgart</a>
+          <div data-ad-comet-preview="message">Post body</div>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                result = _extract_article_data(
+                    page.locator("#target"),
+                    "https://www.facebook.com/groups/kansascitysecrets/posts/123",
+                    "https://www.facebook.com/groups/kansascitysecrets/posts/123",
+                    "123",
+                    context_type="group",
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(result["author"]["name"], "Raymond Baumgart")
+        self.assertEqual(result["author"]["type"], "user")
+        self.assertEqual(result["source"]["name"], "Kansas City Secrets")
+
+    def test_invalid_author_candidates_are_rejected(self) -> None:
+        html = """
+        <div id="target">
+          <a href="/photo">+3</a>
+          <a href="/join">Join</a>
+          <a href="/time">June 16 at 3:59 AM</a>
+          <a href="/metric">12 comments</a>
+        </div>
+        """
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            try:
+                page.set_content(html)
+                author = _extract_author(page.locator("#target"))
+            finally:
+                browser.close()
+
+        self.assertIsNone(author["name"])
+        self.assertIsNone(author["profile_url"])
+
+    def test_modal_title_fallback_extracts_author_name(self) -> None:
+        self.assertEqual(_author_name_from_post_label("Raymond Baumgart's Post"), "Raymond Baumgart")
+        self.assertEqual(_author_name_from_post_label("John Smith’s Post"), "John Smith")
+        self.assertIsNone(_author_name_from_post_label("Join's Post"))
 
     def test_metadata_specific_content_is_partial(self) -> None:
         result = _build_extraction_result(

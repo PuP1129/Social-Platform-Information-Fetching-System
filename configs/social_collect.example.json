@@ -1,0 +1,21 @@
+{
+  "platforms": ["facebook", "x"],
+  "storage_state": {
+    "facebook": ".playwright/facebook_storage_state.json",
+    "x": ".playwright/x_storage_state.json"
+  },
+  "search": {
+    "max_results": 80
+  },
+  "collection": {
+    "limit": 50,
+    "delay": 2,
+    "headless": true,
+    "normalize_output": true
+  },
+  "output": {
+    "run_dir": "output/runs/social-collection",
+    "filename": "social_posts.jsonl",
+    "timestamped": true
+  }
+}

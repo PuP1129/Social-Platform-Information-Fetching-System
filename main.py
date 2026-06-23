@@ -17,7 +17,12 @@ FACEBOOK_BATCH_OUTPUT_PATH = Path("output") / "facebook_posts.jsonl"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Search Google PSE or extract social posts.")
-    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group = parser.add_mutually_exclusive_group()
+    input_group.add_argument(
+        "--collect",
+        action="append",
+        help="Simplified unified social collection keyword. May be repeated.",
+    )
     input_group.add_argument("--keyword", help="Single keyword to search.")
     input_group.add_argument("--x-url", help="Single X post URL to extract.")
     input_group.add_argument("--x-batch-file", type=Path, help="JSON file containing X post URLs to extract.")
@@ -42,8 +47,49 @@ def parse_args() -> argparse.Namespace:
     input_group.add_argument("--facebook-resume-run", type=Path, help="Resume a Facebook run directory.")
     input_group.add_argument("--facebook-retry-failed-run", type=Path, help="Retry retryable failed items in a Facebook run.")
     input_group.add_argument("--facebook-export-run", type=Path, help="Rebuild final JSONL, CSV, and report from a Facebook run.")
+    parser.add_argument(
+        "--x-search-keyword",
+        action="append",
+        help="Search Google PSE and batch-extract X posts. May be repeated.",
+    )
+    parser.add_argument(
+        "--x-search-keywords-file",
+        type=Path,
+        help="JSON file containing X search keywords; may be combined with --x-search-keyword.",
+    )
+    parser.add_argument(
+        "--x-search-max-results",
+        type=int,
+        default=10,
+        help="Maximum number of Google PSE results to inspect per X search keyword.",
+    )
     parser.add_argument("--headless", action="store_true", help="Run Chromium in headless mode.")
     parser.add_argument("--max-results", type=int, default=10, help="Maximum number of merged Google PSE results to save.")
+    parser.add_argument("--config", type=Path, default=None, help="JSON config file for --collect mode.")
+    parser.add_argument("--collect-file", type=Path, default=None, help="JSON string-array keyword file for --collect mode.")
+    parser.add_argument("--limit", type=int, default=None, help="Override collection.limit for --collect mode.")
+    parser.add_argument(
+        "--social-platforms",
+        help="Comma-separated platform list for --collect mode, for example: facebook,x",
+    )
+    parser.add_argument(
+        "--social-search-max-results",
+        type=int,
+        default=None,
+        help="Override search.max_results for --collect mode.",
+    )
+    parser.add_argument(
+        "--social-delay",
+        type=float,
+        default=None,
+        help="Override collection.delay for --collect mode.",
+    )
+    parser.add_argument(
+        "--social-output",
+        type=Path,
+        default=None,
+        help="Explicit JSONL output path for --collect mode.",
+    )
     parser.add_argument(
         "--facebook-search-max-results",
         type=int,
@@ -123,7 +169,29 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write the shared social_post_v1 schema for supported single-post and batch outputs.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    selected_modes = sum(
+        bool(value)
+        for value in (
+            args.keyword,
+            args.x_url,
+            args.x_batch_file,
+            args.facebook_url,
+            args.facebook_batch_file,
+            args.facebook_search_keyword,
+            args.facebook_search_keywords_file,
+            args.facebook_search_manifest,
+            args.facebook_job_config,
+            args.facebook_resume_run,
+            args.facebook_retry_failed_run,
+            args.facebook_export_run,
+            args.x_search_keyword or args.x_search_keywords_file,
+            args.collect or args.collect_file,
+        )
+    )
+    if selected_modes != 1:
+        parser.error("exactly one input mode is required")
+    return args
 
 
 def build_output(keyword: str, results: list[dict[str, str | None]]) -> dict[str, object]:
@@ -162,9 +230,196 @@ def write_output(payload: dict[str, object], output_path: Path) -> None:
     )
 
 
+def run_social_collect(args: argparse.Namespace) -> None:
+    try:
+        from src.config.social_collect import build_social_collect_settings, merge_collect_keywords
+        from src.pipelines.facebook_search_pipeline import run_facebook_multi_search_pipeline
+        from src.pipelines.x_search_pipeline import run_x_search_pipeline
+        from src.search.google_pse import GooglePSESearchError
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+
+    try:
+        selected_keywords = merge_collect_keywords(args.collect, args.collect_file)
+        settings = build_social_collect_settings(
+            keyword=selected_keywords,
+            config_path=args.config,
+            platforms_override=args.social_platforms,
+            limit_override=args.limit,
+            search_max_results_override=args.social_search_max_results,
+            delay_override=args.social_delay,
+            output_override=args.social_output,
+            facebook_storage_state_override=args.facebook_storage_state,
+            x_storage_state_override=args.x_storage_state,
+            headless_override=True if args.headless else None,
+            normalize_output_override=True,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Social collect config error: {exc}") from exc
+
+    print(f"Collecting social posts for {len(settings.keywords)} keyword(s).")
+    print(f"Platforms: {', '.join(settings.platforms)}")
+    print(f"Output: {settings.output_path}")
+
+    remaining = settings.limit
+    output_started = False
+    total_processed = 0
+    platform_summaries: list[dict[str, object]] = []
+
+    for platform in settings.platforms:
+        if remaining <= 0:
+            platform_summaries.append({"platform": platform, "status": "skipped_limit_reached"})
+            continue
+
+        processed = 0
+        if platform == "facebook":
+            try:
+                artifact_dir = settings.output_path.parent / "facebook_artifacts"
+                summary = run_facebook_multi_search_pipeline(
+                    keywords=settings.keywords,
+                    max_results=settings.search_max_results,
+                    storage_state_path=settings.facebook_storage_state,
+                    output_path=settings.output_path,
+                    delay_seconds=settings.delay,
+                    batch_limit=remaining,
+                    headless=settings.headless,
+                    resume=output_started,
+                    artifact_dir=artifact_dir,
+                    record_transform=normalize_social_post,
+                )
+                current = summary.get("batch_current_run", {})
+                processed = int(current.get("record_count", 0) or 0)
+                platform_summaries.append(
+                    _social_platform_summary(
+                        platform="facebook",
+                        search_result_count=summary.get("search_result_count", 0),
+                        accepted_count=summary.get("batch_input_count", 0),
+                        success_count=current.get("success_count", 0),
+                        failed_count=current.get("failed_count", 0),
+                        skipped_count=current.get("skipped_count", 0),
+                    )
+                )
+                if processed > 0:
+                    output_started = True
+            except (ValueError, OSError, RuntimeError, GooglePSESearchError) as exc:
+                platform_summaries.append(_social_platform_failure_summary("facebook", exc))
+        else:
+            try:
+                summary = run_x_search_pipeline(
+                    keywords=settings.keywords,
+                    max_results=settings.search_max_results,
+                    storage_state_path=settings.x_storage_state,
+                    output_path=settings.output_path,
+                    batch_limit=remaining,
+                    delay_seconds=settings.delay,
+                    headless=settings.headless,
+                    resume=output_started,
+                    record_transform=normalize_social_post,
+                )
+                processed = (
+                    int(summary.get("extracted_success_count", 0) or 0)
+                    + int(summary.get("failed_count", 0) or 0)
+                    + int(summary.get("skipped_count", 0) or 0)
+                )
+                platform_summaries.append(
+                    _social_platform_summary(
+                        platform="x",
+                        search_result_count=summary.get("search_result_count", 0),
+                        accepted_count=summary.get("unique_url_count", 0),
+                        success_count=summary.get("extracted_success_count", 0),
+                        failed_count=summary.get("failed_count", 0),
+                        skipped_count=summary.get("skipped_count", 0),
+                        warning=_x_social_warning(summary),
+                    )
+                )
+                if processed > 0:
+                    output_started = True
+            except (ValueError, OSError, RuntimeError, GooglePSESearchError) as exc:
+                platform_summaries.append(_social_platform_failure_summary("x", exc))
+
+        total_processed += processed
+        remaining = max(0, remaining - processed)
+
+    print("Social collect finished.")
+    for item in platform_summaries:
+        if item.get("status") == "skipped_limit_reached":
+            print(f"- {item['platform']}: skipped because collection limit was reached.")
+            continue
+        line = (
+            f"- {item['platform']}: "
+            f"{item.get('search_result_count', 0)} search result(s), "
+            f"{item.get('accepted_count', 0)} accepted URL(s), "
+            f"{item.get('success_count', 0)} success/partial, "
+            f"{item.get('failed_count', 0)} failed, "
+            f"{item.get('skipped_count', 0)} skipped"
+        )
+        if item.get("status") == "failed":
+            line += f", status=failed, reason={item.get('reason')}"
+        elif item.get("warning"):
+            line += f", warning={item.get('warning')}"
+        print(line + ".")
+    print(f"JSONL written to {settings.output_path}")
+    if total_processed == 0 and any(item.get("status") == "failed" for item in platform_summaries):
+        raise SystemExit("Social collect failed before any records were written.")
+
+
+def _social_platform_summary(
+    *,
+    platform: str,
+    search_result_count: object,
+    accepted_count: object,
+    success_count: object,
+    failed_count: object,
+    skipped_count: object,
+    warning: str | None = None,
+) -> dict[str, object]:
+    return {
+        "platform": platform,
+        "status": "completed",
+        "search_result_count": search_result_count,
+        "accepted_count": accepted_count,
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "skipped_count": skipped_count,
+        "warning": warning,
+    }
+
+
+def _social_platform_failure_summary(platform: str, exc: Exception) -> dict[str, object]:
+    message = str(exc)
+    reason = "platform_failed"
+    if platform == "x" and "All X search keywords failed" in message:
+        reason = "google_pse_request_failed"
+    elif "No supported" in message or "no supported" in message:
+        reason = "no_supported_post_urls"
+    return {
+        "platform": platform,
+        "status": "failed",
+        "search_result_count": 0,
+        "accepted_count": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "reason": reason,
+        "error": f"{type(exc).__name__}: {message}",
+    }
+
+
+def _x_social_warning(summary: dict[str, object]) -> str | None:
+    if int(summary.get("search_result_count", 0) or 0) == 0:
+        return "zero_x_search_results"
+    if int(summary.get("unique_url_count", 0) or 0) == 0:
+        return "x_search_results_without_supported_post_urls"
+    if int(summary.get("failed_count", 0) or 0) > 0:
+        return "x_extraction_failed_for_some_posts"
+    return None
+
+
 def main() -> None:
     args = parse_args()
-    if args.keyword:
+    if args.collect:
+        run_social_collect(args)
+    elif args.keyword:
         run_search(args.keyword.strip(), args.headless, args.max_results)
     elif args.x_url:
         run_x_post_extraction(
@@ -178,6 +433,19 @@ def main() -> None:
             input_path=args.x_batch_file,
             output_path=args.x_batch_output,
             limit=args.x_batch_limit,
+            delay_seconds=args.x_batch_delay,
+            resume=args.x_batch_resume,
+            headless=args.headless,
+            storage_state_path=args.x_storage_state,
+            normalize_output=args.normalize_output,
+        )
+    elif args.x_search_keyword or args.x_search_keywords_file:
+        run_x_search_collection(
+            keywords=args.x_search_keyword,
+            keywords_file=args.x_search_keywords_file,
+            max_results=args.x_search_max_results,
+            output_path=args.x_batch_output,
+            batch_limit=args.x_batch_limit,
             delay_seconds=args.x_batch_delay,
             resume=args.x_batch_resume,
             headless=args.headless,
@@ -346,6 +614,54 @@ def run_x_batch_extraction(
         f"{summary['skipped_count']} skipped."
     )
     print(f"JSONL written to {output_path}")
+
+
+def run_x_search_collection(
+    keywords: list[str] | None,
+    keywords_file: Path | None,
+    max_results: int,
+    output_path: Path,
+    batch_limit: int | None,
+    delay_seconds: float,
+    resume: bool,
+    headless: bool,
+    storage_state_path: Path | None,
+    normalize_output: bool = False,
+) -> None:
+    try:
+        from src.pipelines.x_search_pipeline import merge_x_search_keywords, run_x_search_pipeline
+        from src.search.google_pse import GooglePSESearchError
+    except ModuleNotFoundError as exc:
+        _raise_playwright_install_error(exc)
+
+    try:
+        selected_keywords = merge_x_search_keywords(keywords, keywords_file)
+        summary = run_x_search_pipeline(
+            keywords=selected_keywords,
+            max_results=max_results,
+            storage_state_path=storage_state_path,
+            output_path=output_path,
+            batch_limit=batch_limit,
+            delay_seconds=delay_seconds,
+            headless=headless,
+            resume=resume,
+            record_transform=normalize_social_post if normalize_output else None,
+        )
+    except (ValueError, OSError, RuntimeError, GooglePSESearchError) as exc:
+        raise SystemExit(f"X search collection failed: {exc}") from exc
+
+    print(
+        "X search collection finished: "
+        f"{summary['keyword_count']} keyword(s), "
+        f"{summary['search_result_count']} search result(s), "
+        f"{summary['supported_x_post_url_count']} supported X post URL(s), "
+        f"{summary['unique_url_count']} unique URL(s), "
+        f"{summary['extracted_success_count']} extracted, "
+        f"{summary['failed_count']} failed."
+    )
+    if not summary["batch_started"]:
+        print("No supported X post URLs found; X batch was not started.")
+    print(f"JSONL output: {output_path}")
 
 
 def run_facebook_post_extraction(

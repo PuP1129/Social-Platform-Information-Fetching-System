@@ -24,6 +24,7 @@ def run_facebook_search_pipeline(
     storage_state_path: str | Path | None,
     output_path: Path,
     delay_seconds: float = 2.0,
+    batch_limit: int | None = None,
     headless: bool = False,
     resume: bool = False,
     save_debug_bundle: bool = False,
@@ -39,6 +40,7 @@ def run_facebook_search_pipeline(
         storage_state_path=storage_state_path,
         output_path=output_path,
         delay_seconds=delay_seconds,
+        batch_limit=batch_limit,
         headless=headless,
         resume=resume,
         save_debug_bundle=save_debug_bundle,
@@ -55,6 +57,7 @@ def run_facebook_multi_search_pipeline(
     storage_state_path: str | Path | None,
     output_path: Path,
     delay_seconds: float = 2.0,
+    batch_limit: int | None = None,
     headless: bool = False,
     resume: bool = False,
     save_debug_bundle: bool = False,
@@ -67,6 +70,8 @@ def run_facebook_multi_search_pipeline(
     """Search multiple keywords, globally deduplicate Facebook posts, then run batch."""
     normalized_keywords = normalize_keywords(keywords)
     _validate_pipeline_args(max_results, delay_seconds)
+    if batch_limit is not None and batch_limit < 1:
+        raise ValueError("facebook batch limit must be greater than 0.")
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     per_keyword: list[dict[str, Any]] = []
@@ -165,6 +170,7 @@ def run_facebook_multi_search_pipeline(
         output_path=output_path,
         artifact_dir=artifact_dir,
         delay_seconds=delay_seconds,
+        batch_limit=batch_limit,
         headless=headless,
         resume=resume,
         save_debug_bundle=save_debug_bundle,
@@ -197,6 +203,7 @@ def run_facebook_search_manifest_pipeline(
     storage_state_path: str | Path | None,
     output_path: Path,
     delay_seconds: float = 2.0,
+    batch_limit: int | None = None,
     headless: bool = False,
     resume: bool = False,
     save_debug_bundle: bool = False,
@@ -206,6 +213,8 @@ def run_facebook_search_manifest_pipeline(
 ) -> dict[str, Any]:
     """Run Facebook batch directly from a saved search manifest without Google PSE."""
     _validate_pipeline_args(1, delay_seconds)
+    if batch_limit is not None and batch_limit < 1:
+        raise ValueError("facebook batch limit must be greater than 0.")
     artifact_dir.mkdir(parents=True, exist_ok=True)
     manifest = load_facebook_search_manifest(manifest_path)
     items = list(manifest["items"])
@@ -219,6 +228,7 @@ def run_facebook_search_manifest_pipeline(
         output_path=output_path,
         artifact_dir=artifact_dir,
         delay_seconds=delay_seconds,
+        batch_limit=batch_limit,
         headless=headless,
         resume=resume,
         save_debug_bundle=save_debug_bundle,
@@ -460,6 +470,7 @@ def _run_batch_if_needed(
     output_path: Path,
     artifact_dir: Path,
     delay_seconds: float,
+    batch_limit: int | None,
     headless: bool,
     resume: bool,
     save_debug_bundle: bool,
@@ -475,6 +486,7 @@ def _run_batch_if_needed(
         "summary_path": artifact_dir / "batch_summary.json",
         "diagnostics_dir": DEFAULT_BATCH_DIAGNOSTICS_DIR,
         "delay_seconds": delay_seconds,
+        "limit": batch_limit,
         "headless": headless,
         "resume": resume,
         "save_debug_bundle": save_debug_bundle,

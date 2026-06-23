@@ -43,9 +43,11 @@ class SocialPostNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["comment_count"], 12)
         self.assertEqual(normalized["repost_count"], 34)
         self.assertEqual(normalized["view_count"], 789)
+        self.assertEqual(normalized["author"]["type"], "user")
         self.assertIsNone(normalized["share_count"])
         self.assertNotIn("reply_count", normalized)
         self.assertEqual(normalized["platform_metrics"], {"reply_count": 12})
+        self.assertEqual(normalized["platform_context"], {})
 
     def test_normalizes_facebook_post_without_x_metrics(self) -> None:
         normalized = normalize_social_post(
@@ -76,7 +78,125 @@ class SocialPostNormalizationTests(unittest.TestCase):
         self.assertIsNone(normalized["repost_count"])
         self.assertIsNone(normalized["view_count"])
         self.assertIsNone(normalized["author"]["handle"])
+        self.assertEqual(normalized["author"]["type"], "unknown")
         self.assertEqual(normalized["platform_metrics"], {})
+        self.assertEqual(normalized["platform_context"], {})
+
+    def test_normalizes_facebook_page_author_type_when_known(self) -> None:
+        record = _facebook_record()
+        record["author"] = {
+            "name": "Example Page",
+            "profile_url": "https://www.facebook.com/example",
+            "type": "page",
+        }
+        normalized = normalize_social_post(record)
+
+        self.assertEqual(normalized["author"]["type"], "page")
+        self.assertEqual(normalized["collection_status"], "success")
+
+    def test_group_source_author_can_repair_partial_facebook_group_post(self) -> None:
+        normalized = normalize_social_post(
+            {
+                "platform": "facebook",
+                "post_id": "123",
+                "input_url": "https://www.facebook.com/groups/booklovers/posts/123",
+                "canonical_url": "https://www.facebook.com/groups/booklovers/posts/123",
+                "context_type": "group",
+                "author": {"name": None, "profile_url": None},
+                "source": {
+                    "type": "group",
+                    "name": "Book Lovers",
+                    "profile_url": "https://www.facebook.com/groups/booklovers",
+                },
+                "content": "A group post",
+                "publish_time": None,
+                "comment_count": None,
+                "comments": [],
+                "collection_status": "partial",
+                "error": "Missing core field(s): author.",
+            }
+        )
+
+        self.assertEqual(
+            normalized["author"],
+            {
+                "name": "Book Lovers",
+                "handle": None,
+                "profile_url": "https://www.facebook.com/groups/booklovers",
+                "type": "group",
+            },
+        )
+        self.assertEqual(normalized["collection_status"], "success")
+        self.assertIsNone(normalized["error"])
+        self.assertEqual(
+            normalized["platform_context"],
+            {
+                "facebook_group": {
+                    "name": "Book Lovers",
+                    "url": "https://www.facebook.com/groups/booklovers",
+                }
+            },
+        )
+
+    def test_missing_facebook_author_and_group_source_remains_partial(self) -> None:
+        normalized = normalize_social_post(
+            {
+                "platform": "facebook",
+                "post_id": "123",
+                "canonical_url": "https://www.facebook.com/groups/booklovers/posts/123",
+                "context_type": "group",
+                "author": {"name": None, "profile_url": None},
+                "content": "A group post",
+                "collection_status": "partial",
+                "error": "Missing core field(s): author.",
+            }
+        )
+
+        self.assertIsNone(normalized["author"]["name"])
+        self.assertEqual(normalized["author"]["type"], "unknown")
+        self.assertEqual(normalized["collection_status"], "partial")
+
+    def test_group_post_with_user_author_preserves_user_and_context(self) -> None:
+        normalized = normalize_social_post(
+            {
+                "platform": "facebook",
+                "post_id": "123",
+                "canonical_url": "https://www.facebook.com/groups/booklovers/posts/123",
+                "author": {
+                    "name": "Raymond Baumgart",
+                    "profile_url": "https://www.facebook.com/groups/booklovers/user/456",
+                    "type": "user",
+                },
+                "source": {
+                    "type": "group",
+                    "name": "Kansas City Secrets",
+                    "profile_url": "https://www.facebook.com/groups/kansascitysecrets",
+                },
+                "content": "Post body",
+                "collection_status": "success",
+            }
+        )
+
+        self.assertEqual(normalized["author"]["name"], "Raymond Baumgart")
+        self.assertEqual(normalized["author"]["type"], "user")
+        self.assertEqual(normalized["platform_context"]["facebook_group"]["name"], "Kansas City Secrets")
+
+    def test_invalid_facebook_author_candidate_is_rejected(self) -> None:
+        for invalid_name in ("+3", "Join", "June 16 at 3:59 AM", "6w", "12 comments"):
+            with self.subTest(invalid_name=invalid_name):
+                normalized = normalize_social_post(
+                    {
+                        "platform": "facebook",
+                        "post_id": "123",
+                        "canonical_url": "https://www.facebook.com/example/posts/123",
+                        "author": {"name": invalid_name, "profile_url": "https://www.facebook.com/photo"},
+                        "content": "Post body",
+                        "collection_status": "success",
+                    }
+                )
+                self.assertIsNone(normalized["author"]["name"])
+                self.assertEqual(normalized["collection_status"], "partial")
+                self.assertEqual(normalized["error"], "Missing core field(s): author.")
 
     def test_missing_metrics_remain_none(self) -> None:
         normalized = normalize_social_post({"platform": "facebook"})

@@ -38,6 +38,65 @@ X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控
 .\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
+## Simplified Social Collection
+
+For daily collection, prefer the unified config-driven mode:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --collect "Flock camera" --limit 50
+```
+
+Multiple keywords are supported:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --collect "Flock camera" `
+  --collect "license plate reader" `
+  --collect-file "keywords.json" `
+  --limit 50
+```
+
+`--collect-file` must point to a JSON string array.
+
+Config priority is:
+
+1. built-in defaults
+2. `configs/social_collect.local.json`, when present
+3. a file passed with `--config path\to\config.json`
+4. explicit CLI arguments
+
+Copy `configs/social_collect.example.json` to
+`configs/social_collect.local.json` for local daily settings. Local config files
+matching `configs/*.local.json` are ignored by Git, so storage-state paths and
+machine-specific output choices stay local. The config can define platforms,
+Facebook/X storage-state paths, search result count, collection limit, delay,
+headless mode, normalized output, and timestamped run output.
+
+Useful overrides:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --collect "Flock camera" `
+  --config "configs/social_collect.local.json" `
+  --social-platforms "facebook,x" `
+  --social-search-max-results 80 `
+  --social-delay 2 `
+  --social-output "output/runs/social-collection/manual/social_posts.jsonl" `
+  --facebook-storage-state ".playwright/facebook_storage_state.json" `
+  --x-storage-state ".playwright/x_storage_state.json" `
+  --headless
+```
+
+If a configured storage-state file is missing, the command fails with the
+platform name, missing path, and the CLI/config option to fix. Storage-state
+contents, cookies, and tokens are never printed.
+
+Unified collection always writes normalized `social_post_v1` records. Facebook
+group source identity is stored separately under
+`platform_context.facebook_group`; when no individual/page author is available,
+that group identity can be used as a conservative author fallback. X records use
+`author.type: "user"` and an empty `platform_context`.
+
 ## Google PSE 搜索
 
 ```powershell
@@ -81,6 +140,30 @@ X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控
 - `--headless`
 
 默认每行保存现有 X extractor 原始结果；使用 `--normalize-output` 时，每行保存统一的 `social_post_v1` 结果。单条失败会写入 `collection_status: "failed"` 的记录，并继续处理后续 URL。当前不采集评论、线程、引用帖详情或媒体文件。
+
+## X keyword search collection
+
+Search one or more keywords with Google PSE, retain supported X post URLs, and pass
+the unique posts to the existing X batch collector:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --x-search-keyword "OpenAI" `
+  --x-search-keyword "Codex" `
+  --x-search-keywords-file "x_keywords.json" `
+  --x-search-max-results 20 `
+  --x-storage-state ".playwright/x_storage_state.json" `
+  --x-batch-output "output/x_posts.jsonl" `
+  --x-batch-limit 10 `
+  --headless
+```
+
+The keyword file is a JSON string array. CLI and file keywords are merged and
+deduplicated. `--x-search-max-results` applies per keyword; `--x-batch-limit`
+controls the number of unique posts actually extracted. Existing
+`--x-batch-delay`, `--x-batch-resume`, and `--normalize-output` behavior is
+preserved. This mode does not collect comments, threads, quote-post details, or
+media files.
 
 ## Facebook 单帖采集
 

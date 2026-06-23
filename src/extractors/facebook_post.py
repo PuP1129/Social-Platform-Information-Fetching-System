@@ -1226,6 +1226,13 @@ def _extract_article_data(
     no_progress_round_limit: int = 3,
 ) -> dict[str, Any]:
     author = _extract_author(article)
+    source = _extract_post_source(article, canonical_url, context_type)
+    if context_type == "group" and not (author["name"] or author["profile_url"]) and source and source.get("name"):
+        author = {
+            "name": source.get("name"),
+            "profile_url": source.get("profile_url"),
+            "type": "group",
+        }
     content = _extract_content(article)
     publish_time, publish_time_text = _extract_publish_time(article, post_id)
     like_count, comment_count, share_count = _extract_metrics(article)
@@ -1267,6 +1274,7 @@ def _extract_article_data(
         extraction_source="dom",
         metadata_error=None,
         context_type=context_type,
+        source=source,
     )
     if extract_comments:
         result["comments_diagnostics"] = comments_diagnostics
@@ -1291,22 +1299,29 @@ def _build_extraction_result(
     extraction_source: str,
     metadata_error: str | None,
     context_type: str | None = None,
+    source: dict[str, str | None] | None = None,
     comments: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     has_author = bool(author["name"] or author["profile_url"])
     has_content = bool(content)
     has_publish_time = bool(publish_time or publish_time_text)
+    has_group_source_author = context_type == "group" and author.get("type") == "group" and bool(author.get("name"))
+    has_required_group_identity = bool(post_id and canonical_url and has_content and has_group_source_author)
 
     if not has_author and not has_content and not has_publish_time:
         raise FacebookPostExtractionError("No core Facebook post fields could be extracted.")
 
-    status = "success" if extraction_source == "dom" and has_author and has_content and has_publish_time else "partial"
+    status = (
+        "success"
+        if extraction_source == "dom" and ((has_author and has_content and has_publish_time) or has_required_group_identity)
+        else "partial"
+    )
     missing = []
     if not has_author:
         missing.append("author")
     if not has_content:
         missing.append("content")
-    if not has_publish_time:
+    if not has_publish_time and not has_required_group_identity:
         missing.append("publish_time")
 
     error = metadata_error
@@ -1332,6 +1347,8 @@ def _build_extraction_result(
     }
     if context_type:
         result["context_type"] = context_type
+    if source:
+        result["source"] = source
     if publish_time_text:
         result["publish_time_text"] = publish_time_text
     return result
@@ -1410,6 +1427,45 @@ def _build_metadata_result(
     )
 
 
+def _extract_post_source(
+    article: Locator,
+    canonical_url: str,
+    context_type: str | None,
+) -> dict[str, str | None] | None:
+    if context_type != "group":
+        return None
+    group_url = _group_url_from_canonical_url(canonical_url)
+    group_name = _extract_group_name_from_links(article, group_url)
+    if group_name or group_url:
+        return {
+            "type": "group",
+            "name": group_name,
+            "profile_url": group_url,
+        }
+    return None
+
+
+def _extract_group_name_from_links(article: Locator, group_url: str | None) -> str | None:
+    links = article.locator('a[role="link"], a[href]')
+    for index in range(_safe_count(links)):
+        link = links.nth(index)
+        href = link.get_attribute("href") or ""
+        normalized_url = _normalize_facebook_group_url(href)
+        if not normalized_url:
+            continue
+        if group_url and normalized_url != group_url:
+            continue
+        text = _safe_inner_text(link)
+        if text and not _is_unusable_group_source_text(text):
+            return text
+    return None
+
+
+def _is_unusable_group_source_text(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value).strip().lower()
+    return not normalized or normalized in {"groups", "facebook", "shared with public group"}
+
+
 def _extract_author(article: Locator) -> dict[str, str | None]:
     links = article.locator('a[role="link"], a[href]')
     for index in range(links.count()):
@@ -1418,17 +1474,19 @@ def _extract_author(article: Locator) -> dict[str, str | None]:
         href = link.get_attribute("href")
         if not text or not href:
             continue
-        if _is_facebook_profile_url(href):
+        if _is_valid_facebook_author_name(text) and _is_facebook_profile_url(href):
             return {
                 "name": text,
                 "profile_url": _normalize_facebook_profile_url(href),
+                "type": "user" if _is_facebook_group_user_url(href) else "unknown",
             }
 
     fallback_name = _extract_author_name_from_action_label(article) or _extract_author_name_from_dialog_label(article)
-    if fallback_name:
+    if fallback_name and _is_valid_facebook_author_name(fallback_name):
         return {
             "name": fallback_name,
             "profile_url": None,
+            "type": "unknown",
         }
 
     return {
@@ -1472,6 +1530,51 @@ def _author_name_from_action_label(label: str) -> str | None:
 def _author_name_from_post_label(label: str) -> str | None:
     match = re.match(r"(.+?)[’']s Post$", label.strip())
     return match.group(1).strip() if match and match.group(1).strip() else None
+
+
+def _author_name_from_action_label(label: str) -> str | None:
+    match = re.search(r"Actions for this post by\s+(.+)$", label, flags=re.IGNORECASE)
+    candidate = match.group(1).strip() if match and match.group(1).strip() else None
+    return candidate if candidate and _is_valid_facebook_author_name(candidate) else None
+
+
+def _author_name_from_post_label(label: str) -> str | None:
+    stripped = label.strip()
+    for suffix in ("'s Post", "’s Post", "鈥檚 Post", "鈥?s Post"):
+        if stripped.endswith(suffix):
+            candidate = stripped[: -len(suffix)].strip()
+            return candidate if candidate and _is_valid_facebook_author_name(candidate) else None
+    return None
+
+
+def _is_valid_facebook_author_name(value: str) -> bool:
+    normalized = re.sub(r"\s+", " ", value).strip()
+    lowered = normalized.lower()
+    if not normalized or lowered in {"join", "like", "comment", "share", "most relevant"}:
+        return False
+    if re.fullmatch(r"\+\d+", normalized):
+        return False
+    if re.fullmatch(
+        r"\d+\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks|mo|month|months|y|yr|yrs|year|years)",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    if re.fullmatch(
+        r"\d[\d,]*(?:\.\d+)?\s*(k|m|b|万|亿)?\s*(comments?|shares?|reactions?|likes?)",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    if re.fullmatch(
+        r"(today|yesterday|just now)|((jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|september|october|november|december)\b.*)|(\d{1,2}:\d{2}\s*(am|pm)?)",
+        normalized,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    if not re.search(r"[\w\u4e00-\u9fff]", normalized, flags=re.UNICODE):
+        return False
+    return True
 
 
 def _extract_content(article: Locator) -> str | None:
@@ -3560,9 +3663,15 @@ def _is_facebook_profile_url(href: str) -> bool:
     if _is_facebook_group_user_path(path_segments):
         return True
     first_segment = path_segments[0] if path_segments else ""
-    if not first_segment or first_segment in {"permalink.php", "story.php", "posts", "groups", "reel", "watch"}:
+    if not first_segment or first_segment in {"permalink.php", "story.php", "posts", "groups", "reel", "watch", "photo", "photos", "videos"}:
         return False
     return True
+
+
+def _is_facebook_group_user_url(href: str) -> bool:
+    parsed = urlparse(href)
+    path_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    return _is_facebook_group_user_path(path_segments)
 
 
 def _normalize_facebook_profile_url(href: str) -> str:
@@ -3583,6 +3692,30 @@ def _is_facebook_group_user_path(path_segments: list[str]) -> bool:
         and path_segments[2] == "user"
         and bool(path_segments[3])
     )
+
+
+def _group_url_from_canonical_url(canonical_url: str) -> str | None:
+    parsed = urlparse(canonical_url)
+    host = (parsed.hostname or "").lower()
+    if host and host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+        return None
+    path_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    if len(path_segments) >= 2 and path_segments[0] == "groups" and path_segments[1]:
+        return urlunparse(("https", "www.facebook.com", f"/groups/{path_segments[1]}", "", "", ""))
+    return None
+
+
+def _normalize_facebook_group_url(href: str) -> str | None:
+    parsed = urlparse(href)
+    host = (parsed.hostname or "").lower()
+    if host and host not in {"facebook.com", "www.facebook.com", "m.facebook.com"}:
+        return None
+    path_segments = [segment for segment in parsed.path.strip("/").split("/") if segment]
+    if len(path_segments) < 2 or path_segments[0] != "groups" or not path_segments[1]:
+        return None
+    if len(path_segments) >= 3 and path_segments[2] in {"posts", "permalink", "user", "media", "members", "search"}:
+        return None
+    return urlunparse(("https", "www.facebook.com", f"/groups/{path_segments[1]}", "", "", ""))
 
 
 def _strip_url_query_and_fragment(href: str) -> str | None:
