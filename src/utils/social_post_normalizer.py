@@ -141,6 +141,8 @@ def _is_valid_author_name(value: str) -> bool:
     lowered = normalized.lower()
     if not normalized or lowered in _INVALID_AUTHOR_NAMES:
         return False
+    if normalized.startswith("#"):
+        return False
     if _COUNTER_PATTERN.fullmatch(normalized):
         return False
     if _RELATIVE_TIME_PATTERN.fullmatch(normalized):

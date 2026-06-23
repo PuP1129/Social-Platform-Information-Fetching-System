@@ -1109,6 +1109,7 @@ class FacebookExtractionResultTests(unittest.TestCase):
         html = """
         <div id="target">
           <a href="/photo">+3</a>
+          <a href="/tag">#eattherich</a>
           <a href="/join">Join</a>
           <a href="/time">June 16 at 3:59 AM</a>
           <a href="/metric">12 comments</a>

@@ -70,7 +70,9 @@ Copy `configs/social_collect.example.json` to
 matching `configs/*.local.json` are ignored by Git, so storage-state paths and
 machine-specific output choices stay local. The config can define platforms,
 Facebook/X storage-state paths, search result count, collection limit, delay,
-headless mode, normalized output, and timestamped run output.
+headless mode, normalized output, Google PSE timeout, platform order, and
+timestamped run output. By default, unified collection tries X first and lets
+Facebook fill the remaining global limit.
 
 Useful overrides:
 
@@ -80,6 +82,7 @@ Useful overrides:
   --config "configs/social_collect.local.json" `
   --social-platforms "facebook,x" `
   --social-search-max-results 80 `
+  --social-search-timeout-ms 30000 `
   --social-delay 2 `
   --social-output "output/runs/social-collection/manual/social_posts.jsonl" `
   --facebook-storage-state ".playwright/facebook_storage_state.json" `

@@ -92,6 +92,7 @@ def run_x_search_pipeline(
     delay_seconds: float = 2.0,
     headless: bool = False,
     resume: bool = False,
+    timeout_ms: int = 30_000,
     search_fn: SearchFn = search_google_pse_with_metadata,
     batch_fn: BatchFn = run_x_batch,
     record_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -99,6 +100,8 @@ def run_x_search_pipeline(
     normalized_keywords = normalize_x_search_keywords(keywords)
     if max_results < 1:
         raise ValueError("X search max results must be greater than 0.")
+    if timeout_ms < 1:
+        raise ValueError("X search timeout_ms must be greater than 0.")
     if batch_limit is not None and batch_limit < 1:
         raise ValueError("X batch limit must be greater than 0.")
     if delay_seconds < 0:
@@ -110,7 +113,12 @@ def run_x_search_pipeline(
     search_errors: list[dict[str, str]] = []
     for keyword in normalized_keywords:
         try:
-            response = search_fn(keyword=keyword, headless=headless, max_results=max_results)
+            response = search_fn(
+                keyword=keyword,
+                headless=headless,
+                max_results=max_results,
+                timeout_ms=timeout_ms,
+            )
         except Exception as exc:
             keyword_failed_count += 1
             search_errors.append({"keyword": keyword, "error": f"{type(exc).__name__}: {exc}"})

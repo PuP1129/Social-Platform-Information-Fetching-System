@@ -91,12 +91,13 @@ class XSearchPipelineTests(unittest.TestCase):
                 delay_seconds=0.5,
                 headless=True,
                 resume=True,
+                timeout_ms=12_345,
                 search_fn=search_fn,
                 batch_fn=batch_fn,
                 record_transform=transform,
             )
 
-        search_fn.assert_called_once_with(keyword="OpenAI", headless=True, max_results=25)
+        search_fn.assert_called_once_with(keyword="OpenAI", headless=True, max_results=25, timeout_ms=12_345)
         kwargs = batch_fn.call_args.kwargs
         self.assertEqual(kwargs["limit"], 4)
         self.assertEqual(kwargs["delay_seconds"], 0.5)

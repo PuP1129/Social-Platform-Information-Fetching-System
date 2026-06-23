@@ -54,7 +54,7 @@ class GooglePSEPaginationCollectionTests(unittest.TestCase):
     def test_second_page_empty_stops_and_returns_first_page(self) -> None:
         calls: list[tuple[int, int]] = []
 
-        def fetch(_page: object, _keyword: str, start: int, num: int, _page_number: int) -> GooglePSEPageFetch:
+        def fetch(_page: object, _keyword: str, start: int, num: int, _page_number: int, _timeout_ms: int) -> GooglePSEPageFetch:
             calls.append((start, num))
             if start == 1:
                 return GooglePSEPageFetch([_result(f"https://example.com/{index}") for index in range(10)], True)
@@ -68,7 +68,7 @@ class GooglePSEPaginationCollectionTests(unittest.TestCase):
     def test_short_second_page_stops_before_third_page(self) -> None:
         calls: list[tuple[int, int]] = []
 
-        def fetch(_page: object, _keyword: str, start: int, num: int, _page_number: int) -> GooglePSEPageFetch:
+        def fetch(_page: object, _keyword: str, start: int, num: int, _page_number: int, _timeout_ms: int) -> GooglePSEPageFetch:
             calls.append((start, num))
             if start == 1:
                 return GooglePSEPageFetch([_result(f"https://example.com/a{index}") for index in range(10)], True)
@@ -80,7 +80,7 @@ class GooglePSEPaginationCollectionTests(unittest.TestCase):
         self.assertEqual(calls, [(1, 10), (11, 10)])
 
     def test_duplicate_urls_are_removed_preserving_first_order(self) -> None:
-        def fetch(_page: object, _keyword: str, start: int, _num: int, _page_number: int) -> GooglePSEPageFetch:
+        def fetch(_page: object, _keyword: str, start: int, _num: int, _page_number: int, _timeout_ms: int) -> GooglePSEPageFetch:
             if start == 1:
                 return GooglePSEPageFetch(
                     [_result("A"), _result("B"), _result("C")]
@@ -116,7 +116,7 @@ class GooglePSEPaginationCollectionTests(unittest.TestCase):
             _collect_paginated_results(object(), "book", 10, 10, fetch)
 
     def test_later_page_failure_returns_partial_results(self) -> None:
-        def fetch(_page: object, _keyword: str, start: int, _num: int, _page_number: int) -> GooglePSEPageFetch:
+        def fetch(_page: object, _keyword: str, start: int, _num: int, _page_number: int, _timeout_ms: int) -> GooglePSEPageFetch:
             if start == 1:
                 return GooglePSEPageFetch([_result(f"https://example.com/{index}") for index in range(10)], True)
             raise GooglePSESearchError("page failed")
@@ -125,6 +125,24 @@ class GooglePSEPaginationCollectionTests(unittest.TestCase):
 
         self.assertEqual(len(response.results), 10)
         self.assertIn("page 2", response.partial_error or "")
+
+    def test_timeout_is_passed_to_page_fetcher(self) -> None:
+        seen_timeouts: list[int] = []
+
+        def fetch(
+            _page: object,
+            _keyword: str,
+            _start: int,
+            _num: int,
+            _page_number: int,
+            timeout_ms: int,
+        ) -> GooglePSEPageFetch:
+            seen_timeouts.append(timeout_ms)
+            return GooglePSEPageFetch([], False)
+
+        _collect_paginated_results(object(), "book", 10, 10, timeout_ms=12_345, fetch_page=fetch)
+
+        self.assertEqual(seen_timeouts, [12_345])
 
 
 class GooglePSEMainFlowTests(unittest.TestCase):

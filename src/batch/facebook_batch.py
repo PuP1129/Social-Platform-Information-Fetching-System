@@ -141,7 +141,7 @@ def run_facebook_batch(
                 failure_types["batch_stopped_due_to_login_wall"] += 1
                 continue
 
-            print(f"[{index}/{len(items)}] collecting {item.post_id}")
+            print(f"[{index}/{len(items)}] extracting Facebook post {item.post_id}")
             if progress_callback is not None:
                 progress_callback("item_started", {"index": index, "total": len(items), "post_id": item.post_id})
             record, error_type = _process_supported_item(

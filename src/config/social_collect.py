@@ -17,6 +17,7 @@ DEFAULT_SOCIAL_COLLECT_CONFIG: dict[str, Any] = {
     },
     "search": {
         "max_results": 80,
+        "timeout_ms": 30_000,
     },
     "collection": {
         "limit": 50,
@@ -39,6 +40,7 @@ class SocialCollectSettings:
     facebook_storage_state: Path | None
     x_storage_state: Path | None
     search_max_results: int
+    search_timeout_ms: int
     limit: int
     delay: float
     headless: bool
@@ -70,6 +72,7 @@ def build_social_collect_settings(
     platforms_override: str | list[str] | None = None,
     limit_override: int | None = None,
     search_max_results_override: int | None = None,
+    search_timeout_ms_override: int | None = None,
     delay_override: float | None = None,
     output_override: Path | None = None,
     facebook_storage_state_override: Path | None = None,
@@ -80,7 +83,7 @@ def build_social_collect_settings(
     config = load_social_collect_config(config_path, local_config_path=local_config_path)
     keywords = normalize_collect_keywords(keyword)
 
-    platforms = parse_social_platforms(
+    enabled_platforms = parse_social_platforms(
         platforms_override if platforms_override is not None else config.get("platforms")
     )
     collection = _object_at(config, "collection")
@@ -92,12 +95,21 @@ def build_social_collect_settings(
         search_max_results_override if search_max_results_override is not None else search.get("max_results"),
         "search.max_results",
     )
+    search_timeout_ms = _positive_int(
+        search_timeout_ms_override if search_timeout_ms_override is not None else search.get("timeout_ms"),
+        "search.timeout_ms",
+    )
     delay = _non_negative_float(delay_override if delay_override is not None else collection.get("delay"), "collection.delay")
     headless = bool(collection.get("headless", True)) if headless_override is None else headless_override
     normalize_output = (
         bool(collection.get("normalize_output", True))
         if normalize_output_override is None
         else normalize_output_override
+    )
+    platforms = order_social_platforms(
+        enabled_platforms,
+        collection.get("platform_order"),
+        preserve_enabled_order=platforms_override is not None,
     )
 
     facebook_state = _path_or_none(
@@ -116,6 +128,7 @@ def build_social_collect_settings(
         facebook_storage_state=facebook_state,
         x_storage_state=x_state,
         search_max_results=search_max_results,
+        search_timeout_ms=search_timeout_ms,
         limit=limit,
         delay=delay,
         headless=headless,
@@ -184,6 +197,25 @@ def parse_social_platforms(value: str | list[str] | Any) -> list[str]:
     if not platforms:
         raise ValueError("At least one social platform is required.")
     return platforms
+
+
+def order_social_platforms(
+    enabled_platforms: list[str],
+    configured_order: str | list[str] | Any = None,
+    *,
+    preserve_enabled_order: bool = False,
+) -> list[str]:
+    if configured_order is None:
+        if preserve_enabled_order:
+            return list(enabled_platforms)
+        preferred_order = ["x", "facebook"]
+    else:
+        preferred_order = parse_social_platforms(configured_order)
+
+    enabled = set(enabled_platforms)
+    ordered = [platform for platform in preferred_order if platform in enabled]
+    ordered.extend(platform for platform in enabled_platforms if platform not in ordered)
+    return ordered
 
 
 def validate_social_collect_storage(settings: SocialCollectSettings) -> None:

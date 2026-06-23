@@ -27,6 +27,7 @@ def run_facebook_search_pipeline(
     batch_limit: int | None = None,
     headless: bool = False,
     resume: bool = False,
+    timeout_ms: int = 30_000,
     save_debug_bundle: bool = False,
     artifact_dir: Path = DEFAULT_FACEBOOK_SEARCH_DIR,
     search_fn: SearchFn = search_google_pse_with_metadata,
@@ -43,6 +44,7 @@ def run_facebook_search_pipeline(
         batch_limit=batch_limit,
         headless=headless,
         resume=resume,
+        timeout_ms=timeout_ms,
         save_debug_bundle=save_debug_bundle,
         artifact_dir=artifact_dir,
         search_fn=search_fn,
@@ -60,6 +62,7 @@ def run_facebook_multi_search_pipeline(
     batch_limit: int | None = None,
     headless: bool = False,
     resume: bool = False,
+    timeout_ms: int = 30_000,
     save_debug_bundle: bool = False,
     artifact_dir: Path = DEFAULT_FACEBOOK_SEARCH_DIR,
     manifest_path: Path | None = None,
@@ -69,7 +72,7 @@ def run_facebook_multi_search_pipeline(
 ) -> dict[str, Any]:
     """Search multiple keywords, globally deduplicate Facebook posts, then run batch."""
     normalized_keywords = normalize_keywords(keywords)
-    _validate_pipeline_args(max_results, delay_seconds)
+    _validate_pipeline_args(max_results, delay_seconds, timeout_ms)
     if batch_limit is not None and batch_limit < 1:
         raise ValueError("facebook batch limit must be greater than 0.")
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -82,7 +85,12 @@ def run_facebook_multi_search_pipeline(
 
     for keyword in normalized_keywords:
         try:
-            search_response = search_fn(keyword=keyword, headless=headless, max_results=max_results)
+            search_response = search_fn(
+                keyword=keyword,
+                headless=headless,
+                max_results=max_results,
+                timeout_ms=timeout_ms,
+            )
         except Exception as exc:
             per_keyword.append(
                 {
@@ -336,11 +344,13 @@ def _validate_manifest_item(item: Any, index: int) -> None:
         raise ValueError(f"Facebook search manifest item #{index} canonical_url is unsupported.")
 
 
-def _validate_pipeline_args(max_results: int, delay_seconds: float) -> None:
+def _validate_pipeline_args(max_results: int, delay_seconds: float, timeout_ms: int = 30_000) -> None:
     if max_results < 1:
         raise ValueError("facebook search max results must be greater than 0.")
     if delay_seconds < 0:
         raise ValueError("facebook batch delay must be 0 or greater.")
+    if timeout_ms < 1:
+        raise ValueError("facebook search timeout_ms must be greater than 0.")
 
 
 def _rank_search_results(results: list[dict[str, str | None]]) -> list[dict[str, Any]]:

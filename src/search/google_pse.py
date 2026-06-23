@@ -8,7 +8,7 @@ from playwright.sync_api import Locator, Page, TimeoutError as PlaywrightTimeout
 from playwright.sync_api import sync_playwright
 
 GOOGLE_PSE_URL = "https://cse.google.com/cse?cx=e26d7e4e0bc774ea6"
-DEFAULT_TIMEOUT_MS = 45_000
+DEFAULT_TIMEOUT_MS = 30_000
 GOOGLE_PSE_PAGE_SIZE = 10
 GOOGLE_PSE_MAX_RESULTS = 100
 
@@ -52,19 +52,21 @@ class GooglePSESearchResponse:
     partial_error: str | None = None
 
 
-PageFetcher = Callable[[Page, str, int, int, int], GooglePSEPageFetch]
+PageFetcher = Callable[[Page, str, int, int, int, int], GooglePSEPageFetch]
 
 
 def search_google_pse(
     keyword: str,
     headless: bool = False,
     max_results: int = 10,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> list[dict[str, str | None]]:
     """Search Google Programmable Search Engine and return merged results."""
     return search_google_pse_with_metadata(
         keyword=keyword,
         headless=headless,
         max_results=max_results,
+        timeout_ms=timeout_ms,
     ).results
 
 
@@ -72,10 +74,12 @@ def search_google_pse_with_metadata(
     keyword: str,
     headless: bool = False,
     max_results: int = 10,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> GooglePSESearchResponse:
     """Search Google PSE across pages and include pagination metadata."""
     normalized_keyword = _normalize_keyword(keyword)
     requested_count, target_count = _validate_max_results(max_results)
+    timeout_ms = _validate_timeout_ms(timeout_ms)
 
     playwright = None
     browser = None
@@ -93,6 +97,7 @@ def search_google_pse_with_metadata(
             keyword=normalized_keyword,
             requested_count=requested_count,
             target_count=target_count,
+            timeout_ms=timeout_ms,
         )
     finally:
         _close_quietly(page)
@@ -122,12 +127,21 @@ def _validate_max_results(max_results: int) -> tuple[int, int]:
     return max_results, min(max_results, GOOGLE_PSE_MAX_RESULTS)
 
 
+def _validate_timeout_ms(timeout_ms: int) -> int:
+    if not isinstance(timeout_ms, int):
+        raise TypeError("timeout_ms must be an integer.")
+    if timeout_ms < 1:
+        raise ValueError("timeout_ms must be greater than 0.")
+    return timeout_ms
+
+
 def _collect_paginated_results(
     page: Page,
     keyword: str,
     requested_count: int,
     target_count: int,
     fetch_page: PageFetcher | None = None,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> GooglePSESearchResponse:
     fetch = fetch_page or _fetch_google_pse_page
     results: list[dict[str, str | None]] = []
@@ -137,7 +151,7 @@ def _collect_paginated_results(
 
     for page_number, start, num in _planned_page_requests(target_count):
         try:
-            page_fetch = fetch(page, keyword, start, num, page_number)
+            page_fetch = fetch(page, keyword, start, num, page_number, timeout_ms)
         except GooglePSESearchError as exc:
             if page_number == 1:
                 raise
@@ -209,35 +223,36 @@ def _fetch_google_pse_page(
     start: int,
     num: int,
     page_number: int,
+    timeout_ms: int,
 ) -> GooglePSEPageFetch:
     # Google PSE exposes pages in the hosted UI. We still log equivalent start/num
     # values because callers reason about the 1-based PSE result window.
     if page_number == 1:
-        _open_search_page(page)
-        search_input = _find_search_input(page)
+        _open_search_page(page, timeout_ms)
+        search_input = _find_search_input(page, timeout_ms)
         _submit_search(search_input, keyword)
     else:
         if not _go_to_results_page(page, page_number):
             return GooglePSEPageFetch(results=[], has_next_page=False)
 
-    _wait_for_results(page, page_number)
+    _wait_for_results(page, page_number, timeout_ms)
     return GooglePSEPageFetch(
         results=_extract_results(page, num),
         has_next_page=_has_next_page(page, page_number),
     )
 
 
-def _open_search_page(page: Page) -> None:
+def _open_search_page(page: Page, timeout_ms: int) -> None:
     try:
-        page.goto(GOOGLE_PSE_URL, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+        page.goto(GOOGLE_PSE_URL, wait_until="domcontentloaded", timeout=timeout_ms)
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         raise GooglePSEPageOpenError(f"Google PSE page open failed: {exc}") from exc
 
 
-def _find_search_input(page: Page) -> Locator:
+def _find_search_input(page: Page, timeout_ms: int) -> Locator:
     search_input = page.locator("input.gsc-input, #gsc-i-id1").first
     try:
-        search_input.wait_for(state="visible", timeout=DEFAULT_TIMEOUT_MS)
+        search_input.wait_for(state="visible", timeout=timeout_ms)
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         raise GooglePSEInputNotFoundError(f"Google PSE search input was not found: {exc}") from exc
     return search_input
@@ -251,7 +266,7 @@ def _submit_search(search_input: Locator, keyword: str) -> None:
         raise GooglePSEInputNotFoundError(f"Google PSE search input could not be used: {exc}") from exc
 
 
-def _wait_for_results(page: Page, page_number: int) -> None:
+def _wait_for_results(page: Page, page_number: int, timeout_ms: int) -> None:
     try:
         page.wait_for_function(
             """
@@ -273,7 +288,7 @@ def _wait_for_results(page: Page, page_number: int) -> None:
             }
             """,
             arg=page_number,
-            timeout=DEFAULT_TIMEOUT_MS,
+            timeout=timeout_ms,
         )
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         raise GooglePSEResultsNotLoadedError(

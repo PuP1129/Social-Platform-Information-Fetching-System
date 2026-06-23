@@ -1552,6 +1552,8 @@ def _is_valid_facebook_author_name(value: str) -> bool:
     lowered = normalized.lower()
     if not normalized or lowered in {"join", "like", "comment", "share", "most relevant"}:
         return False
+    if normalized.startswith("#"):
+        return False
     if re.fullmatch(r"\+\d+", normalized):
         return False
     if re.fullmatch(

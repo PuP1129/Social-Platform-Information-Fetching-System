@@ -5,13 +5,15 @@
     "x": ".playwright/x_storage_state.json"
   },
   "search": {
-    "max_results": 80
+    "max_results": 80,
+    "timeout_ms": 30000
   },
   "collection": {
     "limit": 50,
     "delay": 2,
-    "headless": true,
-    "normalize_output": true
+    "headless": false,
+    "normalize_output": true,
+    "platform_order": ["x", "facebook"]
   },
   "output": {
     "run_dir": "output/runs/social-collection",

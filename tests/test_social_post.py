@@ -182,7 +182,7 @@ class SocialPostNormalizationTests(unittest.TestCase):
         self.assertEqual(normalized["platform_context"]["facebook_group"]["name"], "Kansas City Secrets")
 
     def test_invalid_facebook_author_candidate_is_rejected(self) -> None:
-        for invalid_name in ("+3", "Join", "June 16 at 3:59 AM", "6w", "12 comments"):
+        for invalid_name in ("#eattherich", "+3", "Join", "June 16 at 3:59 AM", "6w", "12 comments"):
             with self.subTest(invalid_name=invalid_name):
                 normalized = normalize_social_post(
                     {
