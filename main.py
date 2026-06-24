@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.filters.post_url import filter_post_results
@@ -47,6 +48,8 @@ def parse_args() -> argparse.Namespace:
     input_group.add_argument("--facebook-resume-run", type=Path, help="Resume a Facebook run directory.")
     input_group.add_argument("--facebook-retry-failed-run", type=Path, help="Retry retryable failed items in a Facebook run.")
     input_group.add_argument("--facebook-export-run", type=Path, help="Rebuild final JSONL, CSV, and report from a Facebook run.")
+    input_group.add_argument("--init-db", action="store_true", help="Initialize the configured database schema.")
+    input_group.add_argument("--import-jsonl", type=Path, help="Import normalized social-post JSONL into MySQL.")
     parser.add_argument(
         "--x-search-keyword",
         action="append",
@@ -175,6 +178,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write the shared social_post_v1 schema for supported single-post and batch outputs.",
     )
+    parser.add_argument("--db", choices=("mysql",), default=None, help="Database backend for database operations.")
+    parser.add_argument(
+        "--save-db",
+        action="store_true",
+        help="After --collect completes, import its normalized JSONL output into MySQL.",
+    )
     args = parser.parse_args()
     selected_modes = sum(
         bool(value)
@@ -193,10 +202,16 @@ def parse_args() -> argparse.Namespace:
             args.facebook_export_run,
             args.x_search_keyword or args.x_search_keywords_file,
             args.collect or args.collect_file,
+            args.init_db,
+            args.import_jsonl,
         )
     )
     if selected_modes != 1:
         parser.error("exactly one input mode is required")
+    if (args.init_db or args.import_jsonl or args.save_db) and args.db != "mysql":
+        parser.error("--db mysql is required for database operations")
+    if args.save_db and not (args.collect or args.collect_file):
+        parser.error("--save-db is only supported with --collect")
     return args
 
 
@@ -236,7 +251,8 @@ def write_output(payload: dict[str, object], output_path: Path) -> None:
     )
 
 
-def run_social_collect(args: argparse.Namespace) -> None:
+def run_social_collect(args: argparse.Namespace) -> dict[str, object]:
+    started_at = datetime.now(timezone.utc).isoformat()
     try:
         from src.batch.facebook_batch import DEFAULT_BATCH_DIAGNOSTICS_DIR, run_facebook_batch
         from src.batch.x_batch import run_x_batch
@@ -460,6 +476,19 @@ def run_social_collect(args: argparse.Namespace) -> None:
     print(f"JSONL written to {settings.output_path}")
     if total_processed == 0 and any(item.get("status") == "failed" for item in platform_summaries):
         raise SystemExit("Social collect failed before any records were written.")
+    return {
+        "started_at": started_at,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "keywords": settings.keywords,
+        "platform_order": settings.platforms,
+        "global_limit": settings.limit,
+        "output_path": settings.output_path,
+        "summary": {
+            "total_processed": total_processed,
+            "remaining": remaining,
+            "platforms": platform_summaries,
+        },
+    }
 
 
 def _collect_unified_search_results(
@@ -593,8 +622,18 @@ def _x_social_warning(summary: dict[str, object]) -> str | None:
 
 def main() -> None:
     args = parse_args()
-    if args.collect:
-        run_social_collect(args)
+    if args.init_db:
+        run_mysql_init()
+    elif args.import_jsonl:
+        run_mysql_import(args.import_jsonl)
+    elif args.collect or args.collect_file:
+        collection_result = run_social_collect(args)
+        if args.save_db:
+            run_mysql_import(
+                Path(collection_result["output_path"]),
+                run_metadata=collection_result,
+                keywords=list(collection_result["keywords"]),
+            )
     elif args.keyword:
         run_search(args.keyword.strip(), args.headless, args.max_results)
     elif args.x_url:
@@ -675,6 +714,40 @@ def main() -> None:
             save_debug_bundle=args.facebook_save_debug_bundle,
             normalize_output=args.normalize_output,
         )
+
+
+def run_mysql_init() -> None:
+    from src.storage.mysql_store import MySQLStoreError, init_db
+
+    try:
+        init_db()
+    except MySQLStoreError as exc:
+        raise SystemExit(f"MySQL initialization failed: {exc}") from exc
+    print("MySQL schema initialized successfully.")
+
+
+def run_mysql_import(
+    jsonl_path: Path,
+    *,
+    run_metadata: dict[str, object] | None = None,
+    keywords: list[str] | None = None,
+) -> None:
+    from src.storage.mysql_store import MySQLStoreError, import_jsonl_to_mysql
+
+    try:
+        summary = import_jsonl_to_mysql(
+            jsonl_path,
+            run_metadata=run_metadata,
+            keywords=keywords,
+        )
+    except (MySQLStoreError, OSError, ValueError) as exc:
+        raise SystemExit(f"MySQL import failed: {exc}") from exc
+    print(
+        "MySQL import finished: "
+        f"{summary['imported_count']} imported, "
+        f"{summary['skipped_count']} skipped, "
+        f"run_id={summary['run_id']}."
+    )
 
 
 def run_search(keyword: str, headless: bool, max_results: int) -> None:

@@ -100,6 +100,42 @@ group source identity is stored separately under
 that group identity can be used as a conservative author fallback. X records use
 `author.type: "user"` and an empty `platform_context`.
 
+## MySQL Storage
+
+MySQL can persist the normalized JSONL produced by unified collection. Configure
+the connection with `SOCIAL_DB_HOST`, `SOCIAL_DB_PORT` (default `3306`),
+`SOCIAL_DB_NAME`, `SOCIAL_DB_USER`, and `SOCIAL_DB_PASSWORD`. Secret values are
+not printed or stored in repository files.
+
+Initialize the schema:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --init-db --db mysql
+```
+
+Collect normally, keep the JSONL output, and import it after the run:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --collect "flock camera" `
+  --collect "license plate reader" `
+  --limit 30 `
+  --db mysql `
+  --save-db
+```
+
+Existing normalized or raw platform JSONL can also be imported explicitly. Raw
+records are normalized at the storage boundary:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --import-jsonl "output/runs/social-collection/example/social_posts.jsonl" `
+  --db mysql
+```
+
+Re-importing a `(platform, post_id)` updates the stored post rather than creating
+a duplicate. Keyword relationships are also deduplicated.
+
 ## Google PSE 搜索
 
 ```powershell
