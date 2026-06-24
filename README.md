@@ -1,5 +1,7 @@
 # Social Media Post Collector
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 This project collects public social-media posts by keyword from X and Facebook.
 It uses Google Programmable Search Engine (PSE) to discover candidate post URLs,
 extracts supported posts with Playwright, normalizes both platforms into one
