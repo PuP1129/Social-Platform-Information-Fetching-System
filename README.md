@@ -1,361 +1,297 @@
-# 社媒搜索内容采集系统
+# Social Media Post Collector
 
-## 当前支持
+This project collects public social-media posts by keyword from X and Facebook.
+It uses Google Programmable Search Engine (PSE) to discover candidate post URLs,
+extracts supported posts with Playwright, normalizes both platforms into one
+shared schema, and upserts the final records into MySQL.
 
-- Google Programmable Search Engine 关键词搜索
-- X/Facebook 帖子 URL 识别、标准化和过滤
-- 单个 X 帖子采集的实验性实现与诊断
-- 单个 Facebook 公开帖子基础采集
-- Facebook 批量采集与 debug bundle
-- 多关键词 Facebook 搜索到批量采集的 pipeline
-- 配置驱动的 Facebook run 目录、内部结果/最终结果分离、CSV、报告和结构化日志
+JSONL is always retained as a reproducible run artifact and debugging format.
 
-X 采集仍受登录限制影响。Facebook 采集只处理无需绕过访问控制即可查看的内容；项目不实现验证码绕过、代理池或平台访问控制绕过。
+## Main Workflow
 
-## 目录结构
+```text
+keywords
+-> Google PSE search
+-> X/Facebook URL filtering and deduplication
+-> platform post extraction
+-> social_post_v1 normalization
+-> timestamped JSONL output
+-> MySQL author/post/keyword upsert
+```
 
-- `src/`：正式代码
-- `tests/`：离线单元测试
-- `scripts/`：辅助脚本
-- `examples/`：可复用的示例输入和 manifest 样例
-- `configs/`：运行配置样例
-- `docs/`：任务文档
-- `legacy/`：早期实验脚本
-- `output/`：运行产物目录，仅保留 `.gitkeep`
+The default platform priority is X first, followed by Facebook. Facebook uses
+the remaining global collection limit.
 
-## 运行环境
+## Requirements
 
-本项目使用 Windows 本地虚拟环境。执行 Python 命令时请显式使用：
+- Windows
+- Python with the repository-local `.venv`
+- Chromium for Playwright
+- MySQL Server 8.x or a compatible MySQL service
+- A Google Programmable Search Engine page supported by the existing project
+
+Always use the project virtual environment:
 
 ```powershell
 .\.venv\Scripts\python.exe
 ```
 
-安装依赖和浏览器：
+Install Python dependencies and Chromium:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m playwright install chromium
 ```
 
-## Simplified Social Collection
+## MySQL Setup
 
-For daily collection, prefer the unified config-driven mode:
+Create a database and a dedicated user. Adjust the host and password for your
+environment:
 
-```powershell
-.\.venv\Scripts\python.exe main.py --collect "Flock camera" --limit 50
+```sql
+CREATE DATABASE social_collect
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+CREATE USER 'social_user'@'localhost' IDENTIFIED BY 'replace-with-a-strong-password';
+GRANT ALL PRIVILEGES ON social_collect.* TO 'social_user'@'localhost';
+FLUSH PRIVILEGES;
 ```
 
-Multiple keywords are supported:
+Set connection variables in the terminal:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py `
-  --collect "Flock camera" `
-  --collect "license plate reader" `
-  --collect-file "keywords.json" `
-  --limit 50
+$env:SOCIAL_DB_HOST = "127.0.0.1"
+$env:SOCIAL_DB_PORT = "3306"
+$env:SOCIAL_DB_NAME = "social_collect"
+$env:SOCIAL_DB_USER = "social_user"
+$env:SOCIAL_DB_PASSWORD = "your-password"
 ```
 
-`--collect-file` must point to a JSON string array.
+Do not commit passwords. `.env`, local configuration, browser storage state,
+and generated output are ignored by Git.
 
-Config priority is:
-
-1. built-in defaults
-2. `configs/social_collect.local.json`, when present
-3. a file passed with `--config path\to\config.json`
-4. explicit CLI arguments
-
-Copy `configs/social_collect.example.json` to
-`configs/social_collect.local.json` for local daily settings. Local config files
-matching `configs/*.local.json` are ignored by Git, so storage-state paths and
-machine-specific output choices stay local. The config can define platforms,
-Facebook/X storage-state paths, search result count, collection limit, delay,
-headless mode, normalized output, Google PSE timeout, platform order, and
-timestamped run output. By default, unified collection tries X first and lets
-Facebook fill the remaining global limit.
-
-Useful overrides:
+Initialize the tables:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py `
-  --collect "Flock camera" `
-  --config "configs/social_collect.local.json" `
-  --social-platforms "facebook,x" `
-  --social-search-max-results 80 `
-  --social-search-timeout-ms 30000 `
-  --social-delay 2 `
-  --social-output "output/runs/social-collection/manual/social_posts.jsonl" `
-  --facebook-storage-state ".playwright/facebook_storage_state.json" `
-  --x-storage-state ".playwright/x_storage_state.json" `
-  --headless
+.\.venv\Scripts\python.exe main.py --init-db
 ```
 
-If a configured storage-state file is missing, the command fails with the
-platform name, missing path, and the CLI/config option to fix. Storage-state
-contents, cookies, and tokens are never printed.
+`--db mysql` is still accepted for backward compatibility, but MySQL is now the
+default and only database backend.
 
-Unified collection always writes normalized `social_post_v1` records. Facebook
-group source identity is stored separately under
-`platform_context.facebook_group`; when no individual/page author is available,
-that group identity can be used as a conservative author fallback. X records use
-`author.type: "user"` and an empty `platform_context`.
+## Authentication State
 
-## MySQL Storage
+Some public pages still require an authenticated browser session. Login is
+performed manually in a headed browser; credentials are never passed through
+CLI arguments.
 
-MySQL can persist the normalized JSONL produced by unified collection. Configure
-the connection with `SOCIAL_DB_HOST`, `SOCIAL_DB_PORT` (default `3306`),
-`SOCIAL_DB_NAME`, `SOCIAL_DB_USER`, and `SOCIAL_DB_PASSWORD`. Secret values are
-not printed or stored in repository files.
-
-Initialize the schema:
+Create Facebook storage state:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py --init-db --db mysql
+.\.venv\Scripts\python.exe scripts\create_facebook_storage_state.py `
+  --output ".playwright/facebook_storage_state.json"
 ```
 
-Collect normally, keep the JSONL output, and import it after the run:
+Create X storage state interactively:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\create_x_storage_state.py `
+  --output ".playwright/x_storage_state.json"
+```
+
+The X cookie conversion helper is also available for cookies already present in
+environment variables:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\create_x_storage_state_from_cookies.py
+```
+
+Configure storage-state paths in `configs/social_collect.local.json`. Start by
+copying `configs/social_collect.example.json`. Local config files matching
+`configs/*.local.json` are ignored by Git.
+
+## Daily Usage
+
+Collect two keywords with a final global limit of 30:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py `
   --collect "flock camera" `
   --collect "license plate reader" `
-  --limit 30 `
+  --limit 30
+```
+
+The command:
+
+1. searches each keyword once;
+2. splits candidates into X and Facebook buckets;
+3. extracts posts in configured platform order;
+4. writes normalized JSONL;
+5. automatically saves to MySQL when all required `SOCIAL_DB_*` variables are
+   configured.
+
+To keep JSONL only for a run:
+
+```powershell
+.\.venv\Scripts\python.exe main.py --collect "keyword" --limit 10 --no-db
+```
+
+Legacy explicit database flags remain valid:
+
+```powershell
+.\.venv\Scripts\python.exe main.py `
+  --collect "keyword" `
   --db mysql `
   --save-db
 ```
 
-Existing normalized or raw platform JSONL can also be imported explicitly. Raw
-records are normalized at the storage boundary:
+## Import Existing JSONL
+
+Import a previous normalized JSONL run:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py `
-  --import-jsonl "output/runs/social-collection/example/social_posts.jsonl" `
-  --db mysql
+  --import-jsonl "output/runs/social-collection/example/social_posts.jsonl"
 ```
 
-Re-importing a `(platform, post_id)` updates the stored post rather than creating
-a duplicate. Keyword relationships are also deduplicated.
+Raw X or Facebook JSONL records are normalized at the storage boundary when
+possible. Invalid records are counted as failed, while valid records continue
+to import.
 
-## Google PSE 搜索
+Repeated imports do not duplicate posts:
 
-```powershell
-.\.venv\Scripts\python.exe main.py --keyword "OpenAI" --headless --max-results 10
-```
+- posts are upserted by `(platform, post_id)`;
+- authors are reused by platform and profile identity when available;
+- post-keyword relationships are deduplicated.
 
-输出：
+## Output
 
-- `output/search_results.json`
-- `output/post_urls.json`
-
-## X 单帖采集
-
-```powershell
-.\.venv\Scripts\python.exe scripts/create_x_storage_state.py --output ".playwright/x_test_account.json"
-.\.venv\Scripts\python.exe main.py --x-url "https://x.com/OpenAI/status/1234567890" --x-storage-state ".playwright/x_test_account.json"
-```
-
-输出：
-
-- `output/x_post.json`
-- `output/debug/x_post_failure.*`
-
-## X 批量采集
-
-输入 JSON 可以是 URL 字符串数组，或包含 `url` 字段的对象数组。运行：
-
-```powershell
-.\.venv\Scripts\python.exe main.py `
-  --x-batch-file "x_urls.json" `
-  --x-storage-state ".playwright/x_storage_state.json" `
-  --x-batch-output "output/x_posts.jsonl" `
-  --x-batch-delay 2
-```
-
-常用选项：
-
-- `--x-batch-limit 10`
-- `--x-batch-resume`
-- `--normalize-output`
-- `--headless`
-
-默认每行保存现有 X extractor 原始结果；使用 `--normalize-output` 时，每行保存统一的 `social_post_v1` 结果。单条失败会写入 `collection_status: "failed"` 的记录，并继续处理后续 URL。当前不采集评论、线程、引用帖详情或媒体文件。
-
-## X keyword search collection
-
-Search one or more keywords with Google PSE, retain supported X post URLs, and pass
-the unique posts to the existing X batch collector:
-
-```powershell
-.\.venv\Scripts\python.exe main.py `
-  --x-search-keyword "OpenAI" `
-  --x-search-keyword "Codex" `
-  --x-search-keywords-file "x_keywords.json" `
-  --x-search-max-results 20 `
-  --x-storage-state ".playwright/x_storage_state.json" `
-  --x-batch-output "output/x_posts.jsonl" `
-  --x-batch-limit 10 `
-  --headless
-```
-
-The keyword file is a JSON string array. CLI and file keywords are merged and
-deduplicated. `--x-search-max-results` applies per keyword; `--x-batch-limit`
-controls the number of unique posts actually extracted. Existing
-`--x-batch-delay`, `--x-batch-resume`, and `--normalize-output` behavior is
-preserved. This mode does not collect comments, threads, quote-post details, or
-media files.
-
-## Facebook 单帖采集
-
-```powershell
-.\.venv\Scripts\python.exe scripts/create_facebook_storage_state.py --output ".playwright/facebook_storage_state.json"
-.\.venv\Scripts\python.exe main.py --facebook-url "https://www.facebook.com/example/posts/123" --facebook-storage-state ".playwright/facebook_storage_state.json"
-```
-
-输出：
-
-- `output/facebook_post.json`
-- `output/debug/facebook_post_failure.*`
-
-## Facebook 批量采集
-
-```powershell
-.\.venv\Scripts\python.exe main.py `
-  --facebook-batch-file "examples/facebook_batch_urls.example.json" `
-  --facebook-storage-state ".playwright/facebook_storage_state.json" `
-  --facebook-batch-output "output/facebook_posts.jsonl" `
-  --facebook-batch-delay 2
-```
-
-常用选项：
-
-- `--facebook-batch-limit 3`
-- `--facebook-batch-resume`
-- `--facebook-save-debug-bundle`
-- `--headless`
-
-批量输出：
-
-- `output/facebook_posts.jsonl`
-- `output/facebook_batch_summary.json`
-- `output/debug/facebook_batch/`
-
-## Facebook 搜索 Pipeline
-
-```powershell
-.\.venv\Scripts\python.exe main.py `
-  --facebook-search-keywords-file "examples/facebook_keywords.example.json" `
-  --facebook-storage-state ".playwright/facebook_storage_state.json" `
-  --facebook-search-output "output/facebook_search_results.jsonl" `
-  --facebook-search-manifest "output/facebook_search_manifest.json"
-```
-
-示例文件：
-
-- `examples/facebook_keywords.example.json`
-- `examples/facebook_batch_urls.example.json`
-- `examples/facebook_group_urls.example.json`
-- `examples/facebook_search_manifest.example.json`
-- `configs/facebook_job.example.json`
-
-## Facebook Job Config
-
-配置驱动模式会为每次运行创建标准目录：
+Unified collection normally creates:
 
 ```text
-output/runs/<job_name>/<run_id>/
-├── job_config.snapshot.json
-├── search_results.json
-├── filter_results.json
-├── manifest.json
-├── pipeline_state.json
-├── internal_results.jsonl
-├── results.jsonl
-├── failed_items.jsonl
-├── summary.json
-├── results.csv
-├── report.md
-├── logs.jsonl
-└── debug/
+output/runs/social-collection/<UTC timestamp>/
+├── social_posts.jsonl
+└── social_collect_artifacts/
+    ├── search_results.json
+    ├── accepted_urls.json
+    └── platform batch inputs/summaries
 ```
 
-运行：
+The normalized JSONL contains the shared `social_post_v1` fields, including
+platform identity, author, content, publication time, metrics, comments,
+collection status, platform metrics, and platform context.
 
-```powershell
-.\.venv\Scripts\python.exe main.py `
-  --facebook-job-config "configs/facebook_job.example.json"
+MySQL contains:
+
+- `collection_runs`: run metadata, keywords, order, limit, output path, summary
+- `authors`: shared X/Facebook author identities
+- `posts`: normalized post content, metrics, status, and raw JSON
+- `post_keywords`: deduplicated post-to-keyword relationships
+
+## Useful MySQL Queries
+
+Total posts:
+
+```sql
+SELECT COUNT(*) FROM posts;
 ```
 
-常用控制：
+Posts by platform:
 
-```powershell
-.\.venv\Scripts\python.exe main.py --facebook-resume-run "output/runs/facebook-text-monitor/<run_id>"
-.\.venv\Scripts\python.exe main.py --facebook-retry-failed-run "output/runs/facebook-text-monitor/<run_id>"
-.\.venv\Scripts\python.exe main.py --facebook-export-run "output/runs/facebook-text-monitor/<run_id>"
+```sql
+SELECT platform, COUNT(*)
+FROM posts
+GROUP BY platform;
 ```
 
-`--facebook-ignore-history` 可在配置模式下临时关闭跨运行历史去重。配置中只保存 storage-state 路径，不保存 Cookie、账号密码或 storage-state 内容。
+Posts by platform and collection status:
 
-## Raw 与标准化输出
-
-默认情况下，单帖和批量命令继续写入各平台原始结果字段，以保持向后兼容。
-
-在单个 X 帖子、单个 Facebook 帖子、Facebook 直接批量或 Facebook 搜索批量命令中增加：
-
-```text
---normalize-output
+```sql
+SELECT platform, collection_status, COUNT(*)
+FROM posts
+GROUP BY platform, collection_status;
 ```
 
-即可改为写入统一的 `social_post_v1`（`schema_version: "1.0"`）结构。该结构统一作者、正文、发布时间和互动量字段；X 的 `reply_count` 映射为顶层 `comment_count`，并仅在 `platform_metrics.reply_count` 中保留旧字段语义。
+Recent posts:
 
-当下游需要同时消费 X 与 Facebook 数据时使用标准化输出；依赖现有平台字段或诊断字段时继续使用默认 raw 输出。配置驱动的 Facebook job/export 仍使用其现有固定导出 schema，不受该选项影响。
-
-### Internal Result 与 Final Result
-
-`internal_results.jsonl` 保留工程字段，例如 URL、post_id、状态、错误、debug 路径和输入 metadata。
-
-`results.jsonl` 面向用户，每行严格只有 8 个字段：
-
-```json
-{
-  "author": "",
-  "content": "",
-  "publish_time": "",
-  "like_count": null,
-  "share_count": null,
-  "comment_count": null,
-  "comments": []
-}
+```sql
+SELECT id, platform, post_id, collection_status, LEFT(content, 80)
+FROM posts
+ORDER BY id DESC
+LIMIT 10;
 ```
 
-每条评论只包含：
+## Configuration and Advanced CLI
 
-```json
-{
-  "comment_content": "",
-  "comment_time": "",
-  "comment_author": ""
-}
-```
+Configuration priority for unified collection is:
 
-未知数量使用空字符串；页面明确显示 0 时保留整数 `0`。`results.csv` 使用 `utf-8-sig`，方便 Windows Excel 打开中文内容。
+1. built-in defaults
+2. `configs/social_collect.local.json`
+3. a file passed with `--config`
+4. explicit CLI arguments
 
-## 清理生成物
+Useful advanced options include:
 
-查看将被清理的 Python 缓存：
+- `--social-platforms "x,facebook"`
+- `--social-search-max-results 80`
+- `--social-search-timeout-ms 30000`
+- `--social-delay 2`
+- `--social-output <path>`
+- `--facebook-storage-state <path>`
+- `--x-storage-state <path>`
+- `--headless`
 
-```powershell
-.\.venv\Scripts\python.exe scripts/clean_generated.py --dry-run
-```
+Existing single-post, batch, standalone X search, standalone Facebook search,
+Facebook job, resume, retry, export, and debug-bundle modes remain available.
+Run `main.py --help` for the full list.
 
-实际清理：
+## Troubleshooting
 
-```powershell
-.\.venv\Scripts\python.exe scripts/clean_generated.py
-```
+### Google PSE verification or timeout
 
-该脚本不会删除 `output/`、`examples/`、`configs/`、`.playwright/` 或登录态文件。
+Google may display human verification or return fewer results. Try headed mode,
+reduce the search result count, or retry later. The project does not bypass
+CAPTCHA or access controls.
 
-## 测试
+### Missing database environment variables
+
+`--init-db` and `--import-jsonl` report the missing variable names. Normal
+collection keeps JSONL output when no complete MySQL configuration exists.
+
+### MySQL connection failure
+
+Verify that MySQL is running, the database exists, the host and port are
+reachable, and the configured user has privileges on the selected database.
+Passwords are never printed in errors or summaries.
+
+### Facebook or X login issues
+
+Recreate the relevant storage state if it has expired. The extractor does not
+pause for interactive login and does not attempt to bypass verification.
+
+### Partial records
+
+A partial record means one or more core fields could not be confirmed from the
+page. Review the JSONL output and platform diagnostics. Missing optional metrics
+remain `null`; they are not changed to zero unless zero was explicitly observed.
+
+### Duplicate imports
+
+Duplicate `(platform, post_id)` records update the existing database row.
+Metrics, content, status, collection time, context, and raw JSON are refreshed.
+
+## Development
+
+Do not commit:
+
+- `.playwright/`
+- `.env`
+- `configs/*.local.json`
+- `output/`
+- cookies, passwords, tokens, or storage-state files
+
+Run the offline verification suite with:
 
 ```powershell
 .\.venv\Scripts\python.exe -m compileall src tests main.py scripts
@@ -363,15 +299,6 @@ output/runs/<job_name>/<run_id>/
 .\.venv\Scripts\python.exe main.py --help
 ```
 
-## 当前未实现
-
-- 完整 Facebook 评论/楼中楼深度采集
-- Facebook 自动登录或账号密码登录
-- Reel、Watch、视频页、照片页专项采集
-- X 评论采集
-- X 批量采集
-- Reddit
-- MySQL
-- Scheduler
-- 并发采集
-- 验证码绕过、代理池或反检测功能
+The project currently supports X and Facebook. It does not implement CAPTCHA
+bypass, proxy rotation, unrestricted private-content access, or every platform
+DOM variant.

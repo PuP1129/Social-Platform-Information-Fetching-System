@@ -17,7 +17,17 @@ FACEBOOK_BATCH_OUTPUT_PATH = Path("output") / "facebook_posts.jsonl"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Search Google PSE or extract social posts.")
+    parser = argparse.ArgumentParser(
+        description="Collect X/Facebook posts, keep normalized JSONL, and persist to MySQL.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Recommended workflow:\n"
+            "  python main.py --init-db\n"
+            "  python main.py --collect \"keyword\" --limit 30\n"
+            "  python main.py --import-jsonl path\\to\\social_posts.jsonl\n"
+            "Use --no-db with --collect to keep JSONL without saving to MySQL."
+        ),
+    )
     input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         "--collect",
@@ -178,11 +188,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Write the shared social_post_v1 schema for supported single-post and batch outputs.",
     )
-    parser.add_argument("--db", choices=("mysql",), default=None, help="Database backend for database operations.")
+    parser.add_argument(
+        "--db",
+        choices=("mysql",),
+        default="mysql",
+        help="Database backend. MySQL is the default and currently the only supported backend.",
+    )
     parser.add_argument(
         "--save-db",
         action="store_true",
-        help="After --collect completes, import its normalized JSONL output into MySQL.",
+        help="Legacy explicit switch to save --collect output to MySQL; saving is automatic when configured.",
+    )
+    parser.add_argument(
+        "--no-db",
+        action="store_true",
+        help="Disable automatic MySQL saving for this --collect run.",
     )
     args = parser.parse_args()
     selected_modes = sum(
@@ -208,10 +228,12 @@ def parse_args() -> argparse.Namespace:
     )
     if selected_modes != 1:
         parser.error("exactly one input mode is required")
-    if (args.init_db or args.import_jsonl or args.save_db) and args.db != "mysql":
-        parser.error("--db mysql is required for database operations")
     if args.save_db and not (args.collect or args.collect_file):
         parser.error("--save-db is only supported with --collect")
+    if args.no_db and not (args.collect or args.collect_file):
+        parser.error("--no-db is only supported with --collect")
+    if args.save_db and args.no_db:
+        parser.error("--save-db and --no-db cannot be used together")
     return args
 
 
@@ -628,11 +650,28 @@ def main() -> None:
         run_mysql_import(args.import_jsonl)
     elif args.collect or args.collect_file:
         collection_result = run_social_collect(args)
-        if args.save_db:
-            run_mysql_import(
-                Path(collection_result["output_path"]),
-                run_metadata=collection_result,
-                keywords=list(collection_result["keywords"]),
+        from src.storage.mysql_store import mysql_environment_configured
+
+        mysql_enabled = args.save_db or mysql_environment_configured()
+        if args.no_db:
+            print("MySQL disabled for this run (--no-db).")
+        elif mysql_enabled:
+            output_path = Path(collection_result["output_path"])
+            if output_path.is_file() or args.save_db:
+                run_mysql_import(
+                    output_path,
+                    run_metadata=collection_result,
+                    keywords=list(collection_result["keywords"]),
+                )
+            else:
+                print(
+                    "MySQL save skipped because this run did not produce a JSONL file."
+                )
+        else:
+            print(
+                "MySQL not configured; JSONL was kept as the final output. "
+                "Set SOCIAL_DB_HOST, SOCIAL_DB_NAME, SOCIAL_DB_USER, and "
+                "SOCIAL_DB_PASSWORD to enable automatic saving."
             )
     elif args.keyword:
         run_search(args.keyword.strip(), args.headless, args.max_results)
@@ -717,13 +756,14 @@ def main() -> None:
 
 
 def run_mysql_init() -> None:
-    from src.storage.mysql_store import MySQLStoreError, init_db
+    from src.storage.mysql_store import MySQLConfig, MySQLStoreError, init_db
 
     try:
-        init_db()
+        config = MySQLConfig.from_env()
+        init_db(config)
     except MySQLStoreError as exc:
         raise SystemExit(f"MySQL initialization failed: {exc}") from exc
-    print("MySQL schema initialized successfully.")
+    print(f"MySQL schema initialized successfully in database '{config.database}'.")
 
 
 def run_mysql_import(
@@ -732,20 +772,30 @@ def run_mysql_import(
     run_metadata: dict[str, object] | None = None,
     keywords: list[str] | None = None,
 ) -> None:
-    from src.storage.mysql_store import MySQLStoreError, import_jsonl_to_mysql
+    from src.storage.mysql_store import MySQLConfig, MySQLStoreError, import_jsonl_to_mysql
 
     try:
+        config = MySQLConfig.from_env()
+        print(f"MySQL enabled: database '{config.database}'.")
         summary = import_jsonl_to_mysql(
             jsonl_path,
             run_metadata=run_metadata,
             keywords=keywords,
+            config=config,
         )
     except (MySQLStoreError, OSError, ValueError) as exc:
         raise SystemExit(f"MySQL import failed: {exc}") from exc
     print(
-        "MySQL import finished: "
-        f"{summary['imported_count']} imported, "
-        f"{summary['skipped_count']} skipped, "
+        "MySQL save finished: "
+        f"{summary['records_read']} record(s) read, "
+        f"{summary['imported_count']} saved, "
+        f"{summary['failed_count']} failed; "
+        f"posts {summary['posts_inserted']} inserted/"
+        f"{summary['posts_updated']} updated; "
+        f"authors {summary['authors_inserted']} inserted/"
+        f"{summary['authors_updated']} updated; "
+        f"keyword links {summary['keyword_links_inserted']} inserted/"
+        f"{summary['keyword_links_ignored']} ignored; "
         f"run_id={summary['run_id']}."
     )
 

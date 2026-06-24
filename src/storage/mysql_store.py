@@ -134,6 +134,19 @@ class MySQLConfig:
         )
 
 
+def mysql_environment_configured(environ: Mapping[str, str] | None = None) -> bool:
+    values = os.environ if environ is None else environ
+    return all(
+        values.get(name)
+        for name in (
+            "SOCIAL_DB_HOST",
+            "SOCIAL_DB_NAME",
+            "SOCIAL_DB_USER",
+            "SOCIAL_DB_PASSWORD",
+        )
+    )
+
+
 def connect_mysql(config: MySQLConfig | None = None):
     try:
         import pymysql
@@ -163,6 +176,9 @@ def connect_mysql(config: MySQLConfig | None = None):
 class MySQLStore:
     def __init__(self, connection: Any) -> None:
         self.connection = connection
+        self.last_author_action: str | None = None
+        self.last_post_action: str | None = None
+        self.last_keyword_action: str | None = None
 
     def init_db(self) -> None:
         try:
@@ -206,6 +222,7 @@ class MySQLStore:
             return int(cursor.lastrowid)
 
     def upsert_author(self, record: Mapping[str, Any]) -> int | None:
+        self.last_author_action = None
         author = record.get("author")
         if not isinstance(author, Mapping):
             return None
@@ -235,6 +252,7 @@ class MySQLStore:
                     """,
                     (name, handle, profile_url, author_type, _json(author), existing_id),
                 )
+                self.last_author_action = "updated"
                 return existing_id
             cursor.execute(
                 """
@@ -243,6 +261,7 @@ class MySQLStore:
                 """,
                 (platform, name, handle, profile_url, author_type, _json(author)),
             )
+            self.last_author_action = "inserted"
             return int(cursor.lastrowid)
 
     @staticmethod
@@ -287,11 +306,18 @@ class MySQLStore:
         author_id: int | None,
         run_id: int | None,
     ) -> int:
+        self.last_post_action = None
         platform = _string_or_none(record.get("platform"))
         post_id = _string_or_none(record.get("post_id"))
         if platform is None or post_id is None:
             raise MySQLStoreError("A normalized post requires platform and post_id.")
         with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT id FROM posts WHERE platform=%s AND post_id=%s LIMIT 1",
+                (platform, post_id),
+            )
+            existing_row = cursor.fetchone()
+            existing_id = _row_id(existing_row)
             cursor.execute(
                 """
                 INSERT INTO posts (
@@ -346,17 +372,22 @@ class MySQLStore:
                     _json(record),
                 ),
             )
-            return int(cursor.lastrowid)
+            self.last_post_action = "updated" if existing_id is not None else "inserted"
+            return existing_id if existing_id is not None else int(cursor.lastrowid)
 
-    def insert_post_keyword(self, post_db_id: int, keyword: str) -> None:
+    def insert_post_keyword(self, post_db_id: int, keyword: str) -> bool:
+        self.last_keyword_action = None
         normalized = keyword.strip()
         if not normalized:
-            return
+            return False
         with self.connection.cursor() as cursor:
-            cursor.execute(
+            affected = cursor.execute(
                 "INSERT IGNORE INTO post_keywords (post_id, keyword) VALUES (%s, %s)",
                 (post_db_id, normalized),
             )
+        inserted = bool(affected)
+        self.last_keyword_action = "inserted" if inserted else "ignored"
+        return inserted
 
 
 def init_db(
@@ -389,7 +420,14 @@ def import_jsonl_to_mysql(
     store = MySQLStore(selected_connection)
     metadata = dict(run_metadata or {})
     imported_count = 0
-    skipped_count = 0
+    records_read = 0
+    failed_count = 0
+    posts_inserted = 0
+    posts_updated = 0
+    authors_inserted = 0
+    authors_updated = 0
+    keyword_links_inserted = 0
+    keyword_links_ignored = 0
     run_id = 0
     try:
         store.init_db()
@@ -405,23 +443,35 @@ def import_jsonl_to_mysql(
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if not line.strip():
                 continue
+            records_read += 1
             try:
                 loaded = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise MySQLStoreError(
-                    f"Invalid JSON on line {line_number} of {path}."
-                ) from exc
-            if not isinstance(loaded, Mapping):
-                skipped_count += 1
-                continue
-            record = dict(loaded)
-            if record.get("schema_version") is None:
-                record = normalize_social_post(record)
-            author_id = store.upsert_author(record)
-            post_db_id = store.upsert_post(record, author_id, run_id)
-            for keyword in keywords or metadata.get("keywords") or []:
-                store.insert_post_keyword(post_db_id, str(keyword))
-            imported_count += 1
+                if not isinstance(loaded, Mapping):
+                    raise MySQLStoreError(
+                        f"Line {line_number} is not a JSON object."
+                    )
+                record = dict(loaded)
+                if record.get("schema_version") is None:
+                    record = normalize_social_post(record)
+                _validate_normalized_record(record)
+                author_id = store.upsert_author(record)
+                if store.last_author_action == "inserted":
+                    authors_inserted += 1
+                elif store.last_author_action == "updated":
+                    authors_updated += 1
+                post_db_id = store.upsert_post(record, author_id, run_id)
+                if store.last_post_action == "inserted":
+                    posts_inserted += 1
+                else:
+                    posts_updated += 1
+                for keyword in keywords or metadata.get("keywords") or []:
+                    if store.insert_post_keyword(post_db_id, str(keyword)):
+                        keyword_links_inserted += 1
+                    elif str(keyword).strip():
+                        keyword_links_ignored += 1
+                imported_count += 1
+            except (json.JSONDecodeError, ValueError, MySQLStoreError):
+                failed_count += 1
         selected_connection.commit()
     except Exception:
         selected_connection.rollback()
@@ -431,8 +481,15 @@ def import_jsonl_to_mysql(
             selected_connection.close()
     return {
         "run_id": run_id,
+        "records_read": records_read,
         "imported_count": imported_count,
-        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "posts_inserted": posts_inserted,
+        "posts_updated": posts_updated,
+        "authors_inserted": authors_inserted,
+        "authors_updated": authors_updated,
+        "keyword_links_inserted": keyword_links_inserted,
+        "keyword_links_ignored": keyword_links_ignored,
     }
 
 
@@ -472,3 +529,20 @@ def _mysql_datetime(value: Any) -> datetime | date | None:
     except ValueError:
         return None
     return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
+def _row_id(row: Any) -> int | None:
+    if row is None:
+        return None
+    if isinstance(row, Mapping):
+        return int(row["id"])
+    return int(row[0])
+
+
+def _validate_normalized_record(record: Mapping[str, Any]) -> None:
+    platform = _string_or_none(record.get("platform"))
+    post_id = _string_or_none(record.get("post_id"))
+    if platform not in {"x", "facebook"}:
+        raise MySQLStoreError("A normalized post requires platform 'x' or 'facebook'.")
+    if post_id is None:
+        raise MySQLStoreError("A normalized post requires post_id.")

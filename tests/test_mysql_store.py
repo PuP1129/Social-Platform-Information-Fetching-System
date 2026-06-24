@@ -88,6 +88,10 @@ class _FakeCursor:
             return 1
         if compact.startswith("UPDATE authors"):
             return 1
+        if compact.startswith("SELECT id FROM posts"):
+            post = self.connection.posts.get((params[0], params[1]))
+            self._fetchone = None if post is None else (post["id"],)
+            return 0
         if compact.startswith("INSERT INTO posts"):
             platform, post_id = params[0], params[1]
             key = (platform, post_id)
@@ -107,7 +111,10 @@ class _FakeCursor:
             }
             return 1
         if compact.startswith("INSERT IGNORE INTO post_keywords"):
-            self.connection.keywords.add((params[0], params[1]))
+            relation = (params[0], params[1])
+            if relation in self.connection.keywords:
+                return 0
+            self.connection.keywords.add(relation)
             return 1
         raise AssertionError(f"Unexpected SQL: {compact}")
 
@@ -141,6 +148,11 @@ class MySQLStoreTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["imported_count"], 2)
+        self.assertEqual(summary["records_read"], 2)
+        self.assertEqual(summary["failed_count"], 0)
+        self.assertEqual(summary["posts_inserted"], 2)
+        self.assertEqual(summary["authors_inserted"], 2)
+        self.assertEqual(summary["keyword_links_inserted"], 2)
         self.assertEqual(len(connection.posts), 2)
         x_post = connection.posts[("x", "123")]
         facebook_post = connection.posts[("facebook", "456")]
@@ -155,14 +167,18 @@ class MySQLStoreTests(unittest.TestCase):
             path = Path(directory) / "posts.jsonl"
             record = _normalized_x_record()
             path.write_text(json.dumps(record), encoding="utf-8")
-            import_jsonl_to_mysql(path, connection=connection, keywords=["camera"])
+            first = import_jsonl_to_mysql(path, connection=connection, keywords=["camera"])
             record["like_count"] = 99
             path.write_text(json.dumps(record), encoding="utf-8")
-            import_jsonl_to_mysql(path, connection=connection, keywords=["camera"])
+            second = import_jsonl_to_mysql(path, connection=connection, keywords=["camera"])
 
         self.assertEqual(len(connection.posts), 1)
         self.assertEqual(connection.posts[("x", "123")]["like_count"], 99)
         self.assertEqual(connection.keywords, {(1, "camera")})
+        self.assertEqual(first["posts_inserted"], 1)
+        self.assertEqual(second["posts_updated"], 1)
+        self.assertEqual(second["authors_updated"], 1)
+        self.assertEqual(second["keyword_links_ignored"], 1)
         post_sql = next(
             sql for sql, _params in connection.statements
             if sql.startswith("INSERT INTO posts")
@@ -184,6 +200,24 @@ class MySQLStoreTests(unittest.TestCase):
         self.assertIsNone(stored["like_count"])
         self.assertIsNone(stored["share_count"])
 
+    def test_invalid_jsonl_records_are_counted_and_valid_records_continue(self) -> None:
+        connection = _FakeConnection()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "posts.jsonl"
+            path.write_text(
+                "{bad json}\n"
+                + json.dumps({"schema_version": "1.0", "platform": "x"})
+                + "\n"
+                + json.dumps(_normalized_x_record()),
+                encoding="utf-8",
+            )
+            summary = import_jsonl_to_mysql(path, connection=connection)
+
+        self.assertEqual(summary["records_read"], 3)
+        self.assertEqual(summary["imported_count"], 1)
+        self.assertEqual(summary["failed_count"], 2)
+        self.assertEqual(len(connection.posts), 1)
+
     def test_missing_configuration_names_variables_without_printing_password(self) -> None:
         secret = "do-not-print-this-password"
         with self.assertRaises(MySQLStoreError) as caught:
@@ -193,16 +227,17 @@ class MySQLStoreTests(unittest.TestCase):
         self.assertNotIn(secret, message)
 
     def test_cli_recognizes_database_modes(self) -> None:
-        with patch.object(sys, "argv", ["main.py", "--init-db", "--db", "mysql"]):
+        with patch.object(sys, "argv", ["main.py", "--init-db"]):
             init_args = main.parse_args()
         with patch.object(
             sys,
             "argv",
-            ["main.py", "--import-jsonl", "posts.jsonl", "--db", "mysql"],
+            ["main.py", "--import-jsonl", "posts.jsonl"],
         ):
             import_args = main.parse_args()
 
         self.assertTrue(init_args.init_db)
+        self.assertEqual(init_args.db, "mysql")
         self.assertEqual(import_args.import_jsonl, Path("posts.jsonl"))
 
     def test_collect_save_db_imports_the_generated_jsonl(self) -> None:
@@ -231,6 +266,113 @@ class MySQLStoreTests(unittest.TestCase):
             run_metadata=collection_result,
             keywords=["camera"],
         )
+
+    def test_collect_saves_to_mysql_by_default_when_environment_is_configured(self) -> None:
+        environment = {
+            "SOCIAL_DB_HOST": "127.0.0.1",
+            "SOCIAL_DB_NAME": "social_collect",
+            "SOCIAL_DB_USER": "social_user",
+            "SOCIAL_DB_PASSWORD": "secret",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "social.jsonl"
+            output_path.write_text(json.dumps(_normalized_x_record()), encoding="utf-8")
+            collection_result = _collection_result()
+            collection_result["output_path"] = output_path
+            with (
+                patch.dict("os.environ", environment, clear=True),
+                patch.object(sys, "argv", ["main.py", "--collect", "camera"]),
+                patch("main.run_social_collect", return_value=collection_result),
+                patch("main.run_mysql_import") as importer,
+            ):
+                main.main()
+
+        importer.assert_called_once()
+
+    def test_no_db_disables_automatic_mysql_save(self) -> None:
+        environment = {
+            "SOCIAL_DB_HOST": "127.0.0.1",
+            "SOCIAL_DB_NAME": "social_collect",
+            "SOCIAL_DB_USER": "social_user",
+            "SOCIAL_DB_PASSWORD": "secret",
+        }
+        output = io.StringIO()
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch.object(sys, "argv", ["main.py", "--collect", "camera", "--no-db"]),
+            patch("main.run_social_collect", return_value=_collection_result()),
+            patch("main.run_mysql_import") as importer,
+            patch("sys.stdout", output),
+        ):
+            main.main()
+
+        importer.assert_not_called()
+        self.assertIn("MySQL disabled", output.getvalue())
+
+    def test_legacy_db_and_save_db_still_work_without_environment_autodetect(self) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(
+                sys,
+                "argv",
+                ["main.py", "--collect", "camera", "--db", "mysql", "--save-db"],
+            ),
+            patch("main.run_social_collect", return_value=_collection_result()),
+            patch("main.run_mysql_import") as importer,
+        ):
+            main.main()
+
+        importer.assert_called_once()
+
+    def test_import_summary_reports_detailed_counts_without_password(self) -> None:
+        secret = "summary-secret-password"
+        summary = {
+            "run_id": 7,
+            "records_read": 3,
+            "imported_count": 2,
+            "failed_count": 1,
+            "posts_inserted": 1,
+            "posts_updated": 1,
+            "authors_inserted": 1,
+            "authors_updated": 1,
+            "keyword_links_inserted": 2,
+            "keyword_links_ignored": 1,
+        }
+        output = io.StringIO()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "SOCIAL_DB_HOST": "localhost",
+                    "SOCIAL_DB_NAME": "social_collect",
+                    "SOCIAL_DB_USER": "social_user",
+                    "SOCIAL_DB_PASSWORD": secret,
+                },
+                clear=True,
+            ),
+            patch("src.storage.mysql_store.import_jsonl_to_mysql", return_value=summary),
+            patch("sys.stdout", output),
+        ):
+            main.run_mysql_import(Path("posts.jsonl"))
+
+        text = output.getvalue()
+        self.assertIn("3 record(s) read", text)
+        self.assertIn("posts 1 inserted/1 updated", text)
+        self.assertIn("authors 1 inserted/1 updated", text)
+        self.assertNotIn(secret, text)
+
+    def test_help_exposes_recommended_database_options(self) -> None:
+        output = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["main.py", "--help"]),
+            patch("sys.stdout", output),
+        ):
+            with self.assertRaises(SystemExit):
+                main.parse_args()
+        text = output.getvalue()
+        self.assertIn("--init-db", text)
+        self.assertIn("--import-jsonl", text)
+        self.assertIn("--no-db", text)
 
     def test_mysql_cli_error_does_not_echo_password(self) -> None:
         secret = "very-secret-password"
@@ -282,6 +424,18 @@ def _normalized_x_record() -> dict[str, object]:
         "error": None,
         "platform_metrics": {"reply_count": 2},
         "platform_context": {},
+    }
+
+
+def _collection_result() -> dict[str, object]:
+    return {
+        "started_at": "2026-06-24T00:00:00+00:00",
+        "finished_at": "2026-06-24T00:01:00+00:00",
+        "keywords": ["camera"],
+        "platform_order": ["x", "facebook"],
+        "global_limit": 2,
+        "output_path": Path("output/social.jsonl"),
+        "summary": {"total_processed": 1},
     }
 
 
